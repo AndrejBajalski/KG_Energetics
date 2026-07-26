@@ -1,0 +1,87 @@
+I. Graph Nodes (Entities)
+:SubstationTransformer
+Represents the primary stepping transformer at the point of common coupling, changing voltage from the medium-voltage grid down to the European low-voltage framework.
+
+- id (str): Unique identifier for the transformer asset.
+- ratedMVA (double): The power rating capacity of the transformer (e.g., 0.8 MVA).
+- primaryKV (double): High-side voltage level in kilovolts (e.g., 11.0 kV).
+- secondaryKV (double): Low-side voltage level in kilovolts (e.g., 0.416 kV).
+- connectionType (str): Vector group winding arrangement (e.g., "Delta/Grounded-Wye").
+- resistance (double): Percentage resistance of the transformer winding (e.g., 0.004).
+- reactance (double): Percentage reactance of the transformer winding (e.g., 0.04).
+
+
+:Bus
+Represents an intersection point, connection point, or physical node along the low-voltage distribution lines.
+
+- id (int/str): Unique identifier matching the network topology's node labels.
+- x (double): Horizontal spatial coordinate mapped in meters relative to the local substation origin.
+- y (double): Vertical spatial coordinate mapped in meters relative to the local substation origin.
+
+:LineCode
+An abstract metadata template node that captures the structural electrical properties (impedance and admittance matrices) for specific wire models.
+
+- name (str): Unique identifier matching the standardized wire configuration name (e.g., "4c_70", "2c_.007").
+- nphases (int): Number of active phase conductors bundled in the wire segment (typically 3).
+- r1 (double): Positive sequence resistance in ohms per unit length.
+- x1 (double): Positive sequence reactance in ohms per unit length.
+- r0 (double): Zero sequence resistance in ohms per unit length.
+- x0 (double): Zero sequence reactance in ohms per unit length.
+- c1 (double): Positive sequence capacitance in microfarads per unit length.
+- c0 (double): Zero sequence capacitance in microfarads per unit length.
+- units (str): Unit length
+
+:EnergyConsumer (Load)
+Represents a customer drop or individual residential facility drawing power from the local utility grid.
+
+- id (str): Unique consumer node label (e.g., "LOAD1").
+- numPhases (int): The number of connection phases utilized by the load (typically single-phase 1).
+- targetPhase (str): The dedicated individual electrical wire phase the customer draws from (e.g., "A", "B", or "C").
+- baseKW (double): The absolute fundamental peak active power allocation reference value (e.g., 1.0 kW).
+- powerFactor (double): The displacement power factor characterizing the reactive consumption shift (e.g., 0.95).
+- connectionType (str): Configuration pattern of the load tap hookup (e.g., "wye").
+- profileURI (str): Directory location or object storage reference pointing to the 24-hour time-series allocation CSV/Parquet matrix data file.
+
+:SimulationSnapshot
+A diagnostics boundary node used to store validated power flow computation performance markers for baseline evaluation.
+
+- snapshotID (str): Unique stamp combining target evaluation conditions (e.g., "092600_on_peak").
+- timestamp (str): Chronological clock string defining the simulated 1-minute interval marker (e.g., "09:26:00").
+- openDSS_Vmag (double): Benchmark voltage magnitude computed by the OpenDSS engine.
+- gridLabD_Vmag (double): Benchmark voltage magnitude computed by the GridLAB-D engine.
+
+
+II. Graph Edges (Relationships)
+
+[:HAS_FEEDER_HEAD]
+Connects the root grid substation to its descending step-down secondary transformer topology.
+
+Source: :SubstationTransformer → Target: :Bus
+- Attributes: None.
+
+[:LINE_SEGMENT]
+A directed structural edge mapping the physical electrical distribution layout from an upstream bus down toward laterals.
+
+Source: :Bus → Target: :Bus
+- name (str): The individual label tracking the line element (e.g., "LINE1").
+- length (double): Distance between the two endpoint nodes.
+- units (str): Standard physical measurement metric unit (e.g., "m" for meters).
+- phases (str): Valid wire combinations supported on the trace (e.g., "ABC").
+
+[:CONFORMS_TO]
+Links a physical wire path instance to its generalized structural impedance parameter specifications.
+
+Source: Connected relationship context of [:LINE_SEGMENT] → Target: :LineCode
+- Attributes: None.
+
+[:SUPPLIES_POWER]
+Identifies which topological intersection node hosts and powers a consumer connection tap.
+
+Source: :Bus → Target: :EnergyConsumer
+- Attributes: None.
+
+[:RECORDED_STATE]
+Pairs a structural node with its dynamic verification outcome vector layer.
+
+Source: :Bus or :EnergyConsumer → Target: :SimulationSnapshot
+- Attributes: None.

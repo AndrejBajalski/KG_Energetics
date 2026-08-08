@@ -1,29 +1,51 @@
+import configparser
 import os
-from dotenv import load_dotenv
 from pathlib import Path
+
 import pandas as pd
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
+DATA_DIR = BASE_DIR / "data" / "European_LV_CSV"
+
 # ==============================================================================
 # 1. LOAD & CLEAN DATA
 # ==============================================================================
-# Read input CSV files
-df_buscoords = pd.read_csv("../data/European_LV_CSV/Buscoords.csv")
-df_lineCodes = pd.read_csv("../data/European_LV_CSV/LineCodes.csv")
-df_lines = pd.read_csv("../data/European_LV_CSV/Lines.csv")
-df_loads = pd.read_csv("../data/European_LV_CSV/Loads.csv")
-df_loadShapes = pd.read_csv("../data/European_LV_CSV/LoadShapes.csv")
-df_source = pd.read_csv("../data/European_LV_CSV/Source.csv")
-df_transformer = pd.read_csv("../data/European_LV_CSV/Transformer.csv")
+df_buscoords = pd.read_csv(DATA_DIR / "Buscoords.csv")
+df_lineCodes = pd.read_csv(DATA_DIR / "LineCodes.csv")
+df_lines = pd.read_csv(DATA_DIR / "Lines.csv")
+df_loads = pd.read_csv(DATA_DIR / "Loads.csv")
+df_loadShapes = pd.read_csv(DATA_DIR / "LoadShapes.csv")
+df_transformer = pd.read_csv(DATA_DIR / "Transformer.csv")
 
-# Clean up column spaces if any exist in the CSV headers
-for df in [df_buscoords, df_lineCodes, df_lines, df_loads, df_loadShapes, df_source, df_transformer]:
+for df in [df_buscoords, df_lineCodes, df_lines, df_loads, df_loadShapes, df_transformer]:
     df.columns = df.columns.str.strip()
 
-# Convert all dataframes to dictionaries for optimized Neo4j batch insertion
+# Source.csv is NOT a tabular CSV -- it's an INI-style block ([Source] / key=value),
+# so it needs configparser, not pd.read_csv (which was silently wrong before).
+def parse_source_ini(path: Path) -> dict:
+    cp = configparser.ConfigParser()
+    cp.read(path)
+    section = cp[cp.sections()[0]]
+
+    def num(key, default=None):
+        raw = section.get(key, fallback=None)
+        if raw is None:
+            return default
+        return float(raw.strip().split()[0])  # strips units like "11 kV" / "3000 A"
+
+    return {
+        "voltage_kv": num("Voltage"),
+        "pu": num("pu", 1.0),
+        "isc3": num("ISC3"),
+        "isc1": num("ISC1"),
+    }
+
+source_data = parse_source_ini(DATA_DIR / "Source.csv")
+
 buscoords_list = df_buscoords.to_dict(orient="records")
 linecodes_list = df_lineCodes.to_dict(orient="records")
 lines_list = df_lines.to_dict(orient="records")
@@ -48,12 +70,10 @@ class Neo4jConnector:
 
     @classmethod
     def initialize(cls, uri, user, password):
-        """Initializes the underlying Neo4j driver instance once."""
         if cls.driver is None:
             print(f"Initializing global Neo4j driver connection to {uri}...")
             try:
                 cls.driver = GraphDatabase.driver(uri, auth=(user, password))
-                # Explicitly test the connection pool on initialization
                 cls.driver.verify_connectivity()
                 print("Global Neo4j driver successfully initialized.")
             except Exception as e:
@@ -64,14 +84,12 @@ class Neo4jConnector:
 
     @classmethod
     def get_driver(cls):
-        """Retrieves the active driver singleton instance."""
         if cls.driver is None:
             raise RuntimeError("Neo4jConnector driver has not been initialized. Call initialize() first.")
         return cls.driver
 
     @classmethod
     def close(cls):
-        """Closes the active connection pool cleanly."""
         if cls.driver is not None:
             print("Closing global Neo4j driver pool...")
             cls.driver.close()
@@ -79,19 +97,19 @@ class Neo4jConnector:
             print("Global Neo4j driver closed successfully.")
 
 
-# Shortcut helper function to query using the singleton context
 def run_query(query, parameters=None):
     driver = Neo4jConnector.get_driver()
     with driver.session() as session:
         session.run(query, parameters)
 
-# Create Constraints to optimize merge operations and guarantee uniqueness
+
 def setup_constraints():
     print("Verifying database schema constraints...")
     run_query("CREATE CONSTRAINT IF NOT EXISTS FOR (b:Bus) REQUIRE b.id IS UNIQUE")
     run_query("CREATE CONSTRAINT IF NOT EXISTS FOR (l:Load) REQUIRE l.id IS UNIQUE")
     run_query("CREATE CONSTRAINT IF NOT EXISTS FOR (lc:LineCode) REQUIRE lc.name IS UNIQUE")
     run_query("CREATE CONSTRAINT IF NOT EXISTS FOR (t:SubstationTransformer) REQUIRE t.id IS UNIQUE")
+    run_query("CREATE CONSTRAINT IF NOT EXISTS FOR (g:Source) REQUIRE g.id IS UNIQUE")
     print("Database constraints are fully set up.")
 
 
@@ -104,109 +122,148 @@ def ingest_knowledge_graph():
 
     # A. Ingest :Bus Nodes
     print("- Creating Bus Nodes...")
-    bus_query = """
+    run_query("""
     UNWIND $batch AS row
     MERGE (b:Bus {id: toString(row.Busname)})
     SET b.x = toFloat(row.x),
         b.y = toFloat(row.y)
-    """
-    run_query(bus_query, {"batch": buscoords_list})
+    """, {"batch": buscoords_list})
 
     # B. Ingest :LineCode Nodes
     print("- Creating LineCode Nodes...")
-    linecode_query = """
+    run_query("""
     UNWIND $batch AS row
     MERGE (lc:LineCode {name: toString(row.Name)})
     SET lc.nphases = toInteger(row.nphases),
-        lc.r1 = toFloat(row.r1),
-        lc.x1 = toFloat(row.x1),
-        lc.r0 = toFloat(row.r0),
-        lc.x0 = toFloat(row.x0),
-        lc.c1 = toFloat(row.c1),
-        lc.c0 = toFloat(row.c0),
-        lc.units = toString(row.units)
-    """
-    run_query(linecode_query, {"batch": linecodes_list})
+        lc.r1 = toFloat(row.R1),
+        lc.x1 = toFloat(row.X1),
+        lc.r0 = toFloat(row.R0),
+        lc.x0 = toFloat(row.X0),
+        lc.c1 = toFloat(row.C1),
+        lc.c0 = toFloat(row.C0),
+        lc.units = toString(row.Units)
+    """, {"batch": linecodes_list})
 
-    # C. Ingest :EnergyConsumer (Load) Nodes & [:SUPPLIES_POWER] Edges
-    print("- Creating EnergyConsumer Nodes and Relationships...")
-    load_query = """
+    # C. Ingest :Source Node (from Source.csv)
+    print("- Creating Source (Source) Node...")
+    run_query("""
+    MERGE (g:Source {id: 'SourceBus'})
+    SET g.nominalKV = toFloat($voltage_kv),
+        g.pu = toFloat($pu),
+        g.isc3 = toFloat($isc3),
+        g.isc1 = toFloat($isc1)
+    """, source_data)
+
+    # D. Ingest :Load Nodes & [:SUPPLIES_POWER] Edges
+    print("- Creating Load Nodes and Relationships...")
+    run_query("""
     UNWIND $batch AS row
-    // Create the Consumer Node
     MERGE (l:Load {id: toString(row.Name)})
     SET l.numPhases = toInteger(row.numPhases),
         l.targetPhase = toString(row.phases),
         l.baseKW = toFloat(row.kW),
+        l.kV = toFloat(row.kV),
+        l.model = toInteger(row.Model),
         l.powerFactor = toFloat(row.PF),
         l.connectionType = toString(row.Connection),
         l.profileURI = toString(row.Yearly)
 
-    // Connect to the hosting topological Bus
     WITH l, row
     MATCH (b:Bus {id: toString(row.Bus)})
     MERGE (b)-[:SUPPLIES_POWER]->(l)
-    """
-    run_query(load_query, {"batch": loads_list})
+    """, {"batch": loads_list})
 
-    # D. Ingest :SubstationTransformer Nodes & [:HAS_FEEDER_HEAD] Edges
+    # E. Ingest :SubstationTransformer Nodes & Edges
     print("- Creating SubstationTransformer Nodes and Relationships...")
-    transformer_query = """
+    run_query("""
     UNWIND $batch AS row
     MERGE (t:SubstationTransformer {id: toString(row.Name)})
-    SET t.ratedMVA = toFloat(row.MVA),
-        t.primaryKV = toFloat(row.kV_primary),
-        t.secondaryKV = toFloat(row.kV_secondary),
-        t.connectionType = toString(row.Connection),
-        t.resistance = toFloat(row.R_pct),
-        t.reactance = toFloat(row.X_pct)
+    SET t.phases = toInteger(row.phases),
+        t.ratedMVA = toFloat(row.MVA),
+        t.primaryKV = toFloat(row.kV_pri),
+        t.secondaryKV = toFloat(row.kV_sec),
+        t.primaryConn = toString(row.Conn_pri),
+        t.secondaryConn = toString(row.Conn_sec),
+        t.xhl = toFloat(row.`%XHL`),
+        t.resistancePct = toFloat(row.`% resistance`)
 
-    // Connect transformer to its secondary low-voltage secondary bus head
     WITH t, row
-    MATCH (b:Bus {id: toString(row.Bus_secondary)})
-    MERGE (t)-[:HAS_FEEDER_HEAD]->(b)
-    """
-    run_query(transformer_query, {"batch": transformer_list})
+    MATCH (g:Source {id: toString(row.bus1)})
+    MERGE (g)-[:FEEDS]->(t)
 
-    # E. Ingest [:LINE_SEGMENT] Topology and Edge Context [:CONFORMS_TO]
+    WITH t, row
+    MATCH (b:Bus {id: toString(row.bus2)})
+    MERGE (t)-[:HAS_FEEDER_HEAD]->(b)
+    """, {"batch": transformer_list})
+
+    # F. Ingest [:LINE_SEGMENT] Topology and [:CONFORMS_TO] Edge Context
     print("- Linking Bus Topology and Line Specifications...")
-    topology_query = """
+    run_query("""
     UNWIND $batch AS row
     MATCH (b1:Bus {id: toString(row.Bus1)})
     MATCH (b2:Bus {id: toString(row.Bus2)})
     MATCH (lc:LineCode {name: toString(row.LineCode)})
 
-    // Create Directed Physical Line Relationship
     MERGE (b1)-[r:LINE_SEGMENT {name: toString(row.Name)}]->(b2)
     SET r.length = toFloat(row.Length),
         r.units = toString(row.Units),
         r.phases = toString(row.Phases)
 
-    // Link relationship context to LineCode specs
     MERGE (b2)-[:CONFORMS_TO]->(lc)
-    """
-    run_query(topology_query, {"batch": lines_list})
+    """, {"batch": lines_list})
 
     print("Knowledge Graph Ingestion Complete!")
+
+
+def add_derived_relationships():
+    """Post-processing step (from the project handoff, previously never run):
+    precomputed shortcut relationships that give the GNN long-range signal
+    a 2-3 layer message-passing model wouldn't otherwise reach in one pass."""
+
+    print("Adding derived relationships for GNN feature engineering...")
+
+    print("- [:UPSTREAM_OF] full downstream hierarchy from the feeder head...")
+    run_query("""
+        MATCH (t:SubstationTransformer)-[:HAS_FEEDER_HEAD]->(root:Bus)
+        MATCH path = (root)-[:LINE_SEGMENT*]->(target:Bus)
+        WITH nodes(path) AS busNodes
+        UNWIND range(0, size(busNodes)-2) AS i
+        UNWIND range(i+1, size(busNodes)-1) AS j
+        WITH busNodes[i] AS upstreamBus, busNodes[j] AS downstreamBus
+        MERGE (upstreamBus)-[:UPSTREAM_OF]->(downstreamBus)
+        """)
+
+    print("- Bus.hopsFromSource and Bus.cumulativeDownstreamKW (GNN node features)...")
+    run_query("""
+        MATCH (t:SubstationTransformer)-[:HAS_FEEDER_HEAD]->(root:Bus)
+        MATCH path = (root)-[:LINE_SEGMENT*0..]->(b:Bus)
+        WITH b, min(length(path)) AS hops
+        SET b.hopsFromSource = hops
+        """)
+    run_query("""
+        MATCH (b:Bus)
+        OPTIONAL MATCH (b)-[:UPSTREAM_OF]->(:Bus)-[:SUPPLIES_POWER]-(l:Load)
+        OPTIONAL MATCH (b)-[:SUPPLIES_POWER]-(ownLoad:Load)
+        WITH b, coalesce(sum(l.baseKW), 0) + coalesce(sum(ownLoad.baseKW), 0) AS cumKW
+        SET b.cumulativeDownstreamKW = cumKW
+        """)
+
+    print("Derived relationships complete!")
 
 
 # ==============================================================================
 # 4. RUN PIPELINE
 # ==============================================================================
 if __name__ == "__main__":
-
     URI = os.environ.get("NEO4J_URI")
     USER = os.environ.get("NEO4J_USERNAME")
     PASSWORD = os.environ.get("NEO4J_PASSWORD")
-    # Initialize the global connector singleton block once
+
     print("Connecting to Neo4j...")
-    Neo4jConnector.initialize(
-        uri=URI,
-        user=USER,
-        password=PASSWORD
-    )
-    # Execute schema configuration
+    Neo4jConnector.initialize(uri=URI, user=USER, password=PASSWORD)
+
     setup_constraints()
-    # Stream dictionaries to Neo4j database instance via singleton instance
     ingest_knowledge_graph()
-    # Close the active connection pool cleanly
+    add_derived_relationships()
+
     Neo4jConnector.close()

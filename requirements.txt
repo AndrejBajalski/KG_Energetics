@@ -1,0 +1,8 @@
+pandas
+neo4j
+dotenv
+pyarrow
+opendssdirect.py
+numpy
+torch
+torch_geometric

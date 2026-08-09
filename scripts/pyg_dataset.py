@@ -29,8 +29,8 @@ Requires: torch, torch_geometric, neo4j, pandas
 """
 
 import torch, os
-from dotenv import load_dotenv
 from pathlib import Path
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from torch_geometric.data import HeteroData, Dataset
 
@@ -51,7 +51,9 @@ class FeederHeteroSnapshotDataset(Dataset):
     def __init__(self, neo4j_uri, neo4j_user, neo4j_password,
                  load_profiles_path, voltage_labels_path,
                  include_upstream: bool = False, n_timesteps: int = None):
+
         super().__init__()
+
         driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
         with driver.session() as session:
             self._fetch_static_graph(session, include_upstream)
@@ -254,14 +256,18 @@ class FeederHeteroSnapshotDataset(Dataset):
             if ntype == "load":
                 continue  # handled below -- has a time-varying column
             mean = feat.mean(dim=0)
-            std = feat.std(dim=0).clamp(min=1e-6)
+            # unbiased=False avoids NaN for node types with only 1 instance
+            # (Source, SubstationTransformer here) -- the default unbiased
+            # estimator divides by (n-1), which is 0 for a single sample,
+            # and clamp() does NOT fix a NaN, only bounds real numbers.
+            std = feat.std(dim=0, unbiased=False).clamp(min=1e-6)
             self.norm_stats[ntype] = (mean, std)
 
         # Load: static columns are constant across time, but the appended
         # kW column varies -- compute its mean/std from TRAIN timesteps only.
         static_load = self.static_x["load"]
         static_mean = static_load.mean(dim=0)
-        static_std = static_load.std(dim=0).clamp(min=1e-6)
+        static_std = static_load.std(dim=0, unbiased=False).clamp(min=1e-6)
 
         kw_train = torch.tensor(
             self.load_profiles.iloc[list(train_indices)].values, dtype=torch.float
@@ -347,11 +353,15 @@ if __name__ == "__main__":
 
         def forward(self, x_dict, edge_index_dict):
             x_dict = {k: F.relu(self.lin_in[k](v)) for k, v in x_dict.items()}
-            x_dict = self.conv1(x_dict, edge_index_dict)
-            x_dict = {k: F.relu(v) for k, v in x_dict.items()}
-            x_dict = self.conv2(x_dict, edge_index_dict)
-            return self.out(x_dict["bus"]).squeeze(-1)
 
+            out1 = self.conv1(x_dict, edge_index_dict)
+            x_dict = {**x_dict, **out1}
+            x_dict = {k: F.relu(v) for k, v in x_dict.items()}
+
+            out2 = self.conv2(x_dict, edge_index_dict)
+            x_dict = {**x_dict, **out2}
+
+            return self.out(x_dict["bus"]).squeeze(-1)
 
     ds = FeederHeteroSnapshotDataset(
         neo4j_uri=os.environ.get("NEO4J_URI"),
@@ -368,7 +378,7 @@ if __name__ == "__main__":
     model = VoltageHeteroGNN(sample.metadata(), in_dims)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    for epoch in range(50):
+    for epoch in range(20):
         model.train()
         total_loss = 0.0
         for batch in train_loader:

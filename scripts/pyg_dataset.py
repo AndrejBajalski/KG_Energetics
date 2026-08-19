@@ -1,29 +1,12 @@
 """
-pyg_dataset.py (HeteroData version)
+pyg_dataset.py (HeteroData version - Multi-Task Extension)
 
 Builds a heterogeneous graph snapshot dataset from the full Neo4j schema:
 node types {Bus, Load, LineCode, SubstationTransformer, Source} and edge
 types {LINE_SEGMENT, SUPPLIES_POWER, CONFORMS_TO, HAS_FEEDER_HEAD, FEEDS}.
 
-Unlike the earlier homogeneous version, this:
-  - keeps each relationship type as its own edge_index/edge_attr, so a
-    HeteroConv model learns separate weights per relation instead of
-    treating "line segment" and "supplies power" edges identically
-  - folds LineCode impedance (r1/x1/r0/x0/c1/c0) directly into
-    LINE_SEGMENT edge_attr via the CONFORMS_TO link, so the model sees
-    actual electrical impedance, not just line length
-  - includes the Source -> Transformer -> Bus chain, so distance-from-
-    source is represented structurally, not just inferred
-  - reads the precomputed Bus.hopsFromSource / Bus.cumulativeDownstreamKW
-    properties as static node features (cheap Cypher aggregates computed
-    once at ingestion time, not recomputed per training run)
-
-UPSTREAM_OF is deliberately NOT included as a message-passing edge type
-by default -- it's a transitive closure (every bus links to every
-downstream bus), so it's O(n^2) edges and would dominate message passing
-with redundant long-range shortcuts. Pass include_upstream=True to add it
-as an extra relation if you want the GNN to have direct long-range hops
-without stacking many layers.
+Extended to load both Bus Voltage (node labels) and Line Current (edge labels)
+to enable multi-task target predictions natively.
 
 Requires: torch, torch_geometric, neo4j, pandas
 """
@@ -33,6 +16,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 from torch_geometric.data import HeteroData, Dataset
+from torch_geometric.transforms import ToUndirected
+import pandas as pd
+
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BASE_DIR / ".env"
@@ -50,6 +36,7 @@ def _phase_onehot(phase_str):
 class FeederHeteroSnapshotDataset(Dataset):
     def __init__(self, neo4j_uri, neo4j_user, neo4j_password,
                  load_profiles_path, voltage_labels_path,
+                 current_labels_path=None,
                  include_upstream: bool = False, n_timesteps: int = None):
 
         super().__init__()
@@ -60,7 +47,6 @@ class FeederHeteroSnapshotDataset(Dataset):
         driver.close()
 
         # --- Time-varying data ---
-        import pandas as pd
         self.load_profiles = pd.read_csv(load_profiles_path, index_col=0)
         raw_voltages = pd.read_csv(voltage_labels_path, index_col=0)
         self.voltage_labels = self._collapse_phase_columns_to_bus(raw_voltages)
@@ -71,6 +57,7 @@ class FeederHeteroSnapshotDataset(Dataset):
             raise ValueError(f"Load profiles missing columns for: {missing}")
         self.load_profiles = self.load_profiles[load_names]
 
+        # Map Voltage Labels to Bus Node Order
         bus_names = self.node_id["bus"]
         self._bus_label_mask = torch.tensor(
             [b in self.voltage_labels.columns for b in bus_names], dtype=torch.bool
@@ -81,25 +68,128 @@ class FeederHeteroSnapshotDataset(Dataset):
                   f"be excluded from the loss: {missing_bus[:5]}{'...' if len(missing_bus) > 5 else ''}")
         self.voltage_labels = self.voltage_labels.reindex(columns=bus_names)
 
+        # Map Current Labels to Line Segment Edge Order
+        self.has_current_labels = False
+        if current_labels_path is not None and os.path.exists(current_labels_path):
+            self.current_labels = pd.read_csv(current_labels_path, index_col=0)
+
+            line_edge_names = self.line_names[("bus", "line_segment", "bus")]
+            # Standardize column naming if OpenDSS formats them differently
+            self.current_labels.columns = [str(c).lower().strip() for c in self.current_labels.columns]
+            line_edge_names_lower = [str(n).lower().strip() for n in line_edge_names]
+
+            self._line_label_mask = torch.tensor(
+                [ln in self.current_labels.columns for ln in line_edge_names_lower], dtype=torch.bool
+            )
+
+            # Diagnostic: unlike bus voltage, this coverage check didn't
+            # exist before. If most lines show up here, current_labels.csv
+            # column names don't match Neo4j's line-segment r.name values
+            # (e.g. an OpenDSS "Line." prefix) and the loss is silently
+            # being computed on only a handful of lines.
+            missing_lines = [
+                orig for orig, present in zip(line_edge_names, self._line_label_mask.tolist())
+                if not present
+            ]
+            if missing_lines:
+                print(f"NOTE: {len(missing_lines)}/{len(line_edge_names)} line segments have no "
+                      f"current label and will be excluded from the loss: {missing_lines[:5]}"
+                      f"{'...' if len(missing_lines) > 5 else ''}")
+
+            self.current_labels = self.current_labels.reindex(columns=line_edge_names_lower)
+            self.has_current_labels = True
+
         self.n_timesteps = n_timesteps or len(self.load_profiles)
+
+        # Per-item pandas .iloc on a ~2700-column frame is slow and runs
+        # 1000+ times per epoch. The frames never change after this point,
+        # so convert once to contiguous float32 arrays and index those.
+        self._load_np = self.load_profiles.to_numpy(dtype="float32")
+        self._voltage_np = self.voltage_labels.to_numpy(dtype="float32")
+        self._current_np = (
+            self.current_labels.to_numpy(dtype="float32")
+            if self.has_current_labels else None
+        )
+
+        # Every relation ingested from Neo4j points from source toward load
+        # (Source -> Transformer -> Bus -> Bus (line_segment) -> Load), and
+        # HeteroConv/SAGEConv only propagates along edge direction. That
+        # means a Load's real-time kW — the only per-timestep-varying input
+        # in the whole graph — has no directed path back to any Bus, and no
+        # Bus/line has a path to anything downstream of it at any number of
+        # hops. merge=False keeps same-type (bus, bus) relations as two
+        # separate directed relations (line_segment + rev_line_segment)
+        # rather than symmetrizing them, so the forward line_segment
+        # relation used by the current-prediction head — and its y /
+        # label_mask, which are only sized for the forward direction — is
+        # left untouched.
+        self._to_undirected = ToUndirected(merge=False)
+
+        # Cached template graph, built lazily on first get() and rebuilt
+        # whenever normalization is re-fit. See _get_template().
+        self._template = None
+
+    # ------------------------------------------------------------------
+    def _get_template(self):
+        """Everything in a snapshot that does NOT vary with the timestep.
+
+        The topology, every static node feature and every edge attribute
+        are identical across all timesteps — only a Load's kW column and
+        the two label vectors change. Previously get() rebuilt all of it
+        per item: cloning every static tensor, re-running normalization
+        over all node types and edge attrs, and re-running ToUndirected
+        (which sorts/coalesces every relation) 1000+ times per epoch.
+
+        Now that work happens once and the result is reused. get() builds
+        a fresh HeteroData that points at these same tensors; PyG's
+        collation concatenates into new storage, so sharing is safe (the
+        original code already shared self.edge_attr this way). Numerically
+        this is identical to the previous behaviour.
+        """
+        if self._template is not None:
+            return self._template
+
+        data = HeteroData()
+        for ntype, feat in self.static_x.items():
+            data[ntype].x = feat.clone()
+
+        # Placeholder kW column so the load feature width matches what
+        # get() will produce; the values are overwritten every item.
+        n_load = self.static_x["load"].size(0)
+        data["load"].x = torch.cat(
+            [self.static_x["load"], torch.zeros(n_load, 1)], dim=1
+        )
+
+        for rel, ei in self.edge_index.items():
+            data[rel].edge_index = ei
+        for rel, ea in self.edge_attr.items():
+            data[rel].edge_attr = ea
+
+        if getattr(self, "norm_stats", None) is not None:
+            for ntype in data.node_types:
+                mean, std = self.norm_stats[ntype]
+                data[ntype].x = (data[ntype].x - mean) / std
+            for rel in data.edge_types:
+                if rel in self.edge_attr:
+                    mean, std = self.norm_stats[rel]
+                    data[rel].edge_attr = (data[rel].edge_attr - mean) / std
+
+        data = self._to_undirected(data)
+        self._template = data
+        return data
 
     # ------------------------------------------------------------------
     @staticmethod
     def _collapse_phase_columns_to_bus(df):
-        """bus_voltages.csv has one column per bus-phase terminal ('1.1',
-        '1.2', '1.3', ...). Collapse to one column per Bus via min Vpu
-        across present phases (a single sagging phase should count)."""
         bus_of = {col: col.split(".")[0] for col in df.columns}
         out = {}
         for bus_name in sorted(set(bus_of.values()), key=lambda b: (len(b), b)):
             cols = [c for c, b in bus_of.items() if b == bus_name]
             out[bus_name] = df[cols].min(axis=1)
-        import pandas as pd
         return pd.DataFrame(out)
 
     # ------------------------------------------------------------------
     def _fetch_static_graph(self, session, include_upstream):
-        # ---- Nodes, one query per type ----
         bus_rows = session.run("""
             MATCH (b:Bus)
             RETURN b.id AS id, coalesce(b.x, 0.0) AS x, coalesce(b.y, 0.0) AS y,
@@ -147,7 +237,7 @@ class FeederHeteroSnapshotDataset(Dataset):
             "source": [r["id"] for r in source_rows],
         }
         idx_of = {t: {name: i for i, name in enumerate(ids)} for t, ids in self.node_id.items()}
-        self._idx_of = idx_of  # kept for edge-building below
+        self._idx_of = idx_of
 
         self.static_x = {
             "bus": torch.tensor(
@@ -172,13 +262,11 @@ class FeederHeteroSnapshotDataset(Dataset):
             ),
         }
 
-        # ---- Edges, one query per relationship type ----
-        # LINE_SEGMENT with LineCode impedance folded in via CONFORMS_TO
-        # (CONFORMS_TO is attached to the line's target bus, per ingestion schema)
+        # ---- Edges Mapping ----
         line_rows = session.run("""
             MATCH (b1:Bus)-[r:LINE_SEGMENT]->(b2:Bus)
             OPTIONAL MATCH (b2)-[:CONFORMS_TO]->(lc:LineCode)
-            RETURN b1.id AS src, b2.id AS dst,
+            RETURN b1.id AS src, b2.id AS dst, r.name AS name,
                    coalesce(r.length, 0.0) AS length, coalesce(r.phases, '') AS phases,
                    coalesce(lc.r1, 0.0) AS r1, coalesce(lc.x1, 0.0) AS x1,
                    coalesce(lc.r0, 0.0) AS r0, coalesce(lc.x0, 0.0) AS x0,
@@ -220,6 +308,46 @@ class FeederHeteroSnapshotDataset(Dataset):
         }
 
         line_rows_valid = [r for r in line_rows if r["src"] in idx_of["bus"] and r["dst"] in idx_of["bus"]]
+
+        # ---- Downstream-load membership matrix ----
+        # M[b, l] = 1 iff Load l sits at or below Bus b in the feeder.
+        # Line current is essentially P_downstream(t) / (sqrt(3) * V), so
+        # M @ kw_t gives each bus the exact real-time demand it carries.
+        # The GNN cannot reconstruct this on its own: with 55 loads across
+        # ~900 buses and 2 conv layers, most buses have no load within
+        # reach, so their inputs were byte-identical at every timestep and
+        # the best possible prediction was each line's mean (which is what
+        # the model had converged to).
+        #
+        # Built by walking UP from each load's bus to all of its ancestors,
+        # using only LINE_SEGMENT direction — no dependency on UPSTREAM_OF
+        # existing or on what exactly it means. 55 loads * ~900 buses, so
+        # this is instant and happens once.
+        parents = {}
+        for r in line_rows_valid:
+            parents.setdefault(idx_of["bus"][r["dst"]], []).append(idx_of["bus"][r["src"]])
+
+        M = torch.zeros(len(self.node_id["bus"]), len(self.node_id["load"]))
+        for r in supply_rows:
+            if r["src"] not in idx_of["bus"] or r["dst"] not in idx_of["load"]:
+                continue
+            l_i = idx_of["load"][r["dst"]]
+            stack, seen = [idx_of["bus"][r["src"]]], set()
+            while stack:
+                u = stack.pop()
+                if u in seen:
+                    continue
+                seen.add(u)
+                stack.extend(parents.get(u, ()))
+            for u in seen:
+                M[u, l_i] = 1.0
+        self.downstream_load_matrix = M
+
+        # Track line names aligned to edge_index for targets
+        self.line_names = {
+            ("bus", "line_segment", "bus"): [r["name"] for r in line_rows_valid]
+        }
+
         self.edge_attr = {
             ("bus", "line_segment", "bus"): torch.tensor(
                 [[r["length"]] + _phase_onehot(r["phases"]) +
@@ -238,33 +366,24 @@ class FeederHeteroSnapshotDataset(Dataset):
 
     # ------------------------------------------------------------------
     def fit_normalization(self, train_indices):
-        """Compute per-node-type feature mean/std for z-score normalization,
-        using ONLY the training timesteps (never val/test, to avoid leaking
-        their distribution into training). Must be called before get() if
-        you want normalized features -- time_split() calls this
-        automatically by default.
-
-        Coordinates, cumulative downstream kW, and load kW sit several
-        orders of magnitude apart from impedance/phase features; without
-        this, the first linear layer sees wildly different feature scales
-        and training is unstable (this is what caused MSE ~17 instead of
-        the ~0.001-0.01 you'd expect for Vpu regression).
-        """
         self.norm_stats = {}
+        # Stats changed, so the cached normalized template is stale.
+        self._template = None
 
+        # Node Normalization
         for ntype, feat in self.static_x.items():
             if ntype == "load":
-                continue  # handled below -- has a time-varying column
+                continue
             mean = feat.mean(dim=0)
-            # unbiased=False avoids NaN for node types with only 1 instance
-            # (Source, SubstationTransformer here) -- the default unbiased
-            # estimator divides by (n-1), which is 0 for a single sample,
-            # and clamp() does NOT fix a NaN, only bounds real numbers.
             std = feat.std(dim=0, unbiased=False).clamp(min=1e-6)
             self.norm_stats[ntype] = (mean, std)
 
-        # Load: static columns are constant across time, but the appended
-        # kW column varies -- compute its mean/std from TRAIN timesteps only.
+        # Edge Normalization
+        for rel, attr in self.edge_attr.items():
+            mean = attr.mean(dim=0)
+            std = attr.std(dim=0, unbiased=False).clamp(min=1e-6)
+            self.norm_stats[rel] = (mean, std)
+
         static_load = self.static_x["load"]
         static_mean = static_load.mean(dim=0)
         static_std = static_load.std(dim=0, unbiased=False).clamp(min=1e-6)
@@ -280,36 +399,106 @@ class FeederHeteroSnapshotDataset(Dataset):
             torch.cat([static_std, kw_std]),
         )
 
+        # Downstream-kW bus feature stats, fit on the training split.
+        # Two columns, because they carry different things:
+        #   abs  — one global mean/std, preserving proportionality between
+        #          buses (a trunk really does carry 50x a lateral).
+        #   dev  — per-bus mean/std, i.e. this bus's deviation from its own
+        #          typical loading. The current target is per-line
+        #          normalized, so the deviation is the directly matched
+        #          input; without it, a lateral's tiny absolute swing has
+        #          to drive a full-scale normalized output.
+        # std clamped at 1e-3 kW so buses with no downstream load stay ~0
+        # instead of amplifying float noise.
+        dkw_train = kw_train @ self.downstream_load_matrix.t()  # [T_train, n_bus]
+        self.norm_stats[("dkw_abs",)] = (
+            dkw_train.mean().unsqueeze(0),
+            dkw_train.std().clamp(min=1e-3).unsqueeze(0),
+        )
+        self.norm_stats[("dkw_dev",)] = (
+            dkw_train.mean(dim=0),
+            dkw_train.std(dim=0).clamp(min=1e-3),
+        )
+
+        # Line current TARGET normalization — per line, not global.
+        # Current magnitude in a radial feeder varies by orders of
+        # magnitude depending on a line's position (trunk vs. lateral),
+        # unlike per-unit voltage which sits near 1.0 everywhere. A single
+        # global mean/std makes the model chase the few high-current trunk
+        # lines while effectively ignoring the rest, so each line instead
+        # gets its own training-set statistics (its magnitude is fairly
+        # consistent across timesteps since it's driven by topology).
+        if getattr(self, "has_current_labels", False):
+            train_currents = torch.tensor(
+                self.current_labels.iloc[list(train_indices)].values, dtype=torch.float
+            )  # [T_train, n_lines], NaN where a line has no matching label column
+            valid = ~torch.isnan(train_currents)
+            i_mean = torch.nan_to_num(train_currents.nanmean(dim=0), nan=0.0)
+            centered = torch.where(valid, train_currents - i_mean, torch.zeros_like(train_currents))
+            i_var = (centered ** 2).sum(dim=0) / valid.sum(dim=0).clamp(min=1)
+            i_std = i_var.sqrt().clamp(min=1e-6)
+            self.norm_stats[("current_target",)] = (i_mean, i_std)
+
     # ------------------------------------------------------------------
     def len(self):
         return self.n_timesteps
 
     def get(self, idx):
+        # Static structure (topology, static features, edge attrs, reverse
+        # relations, normalization) is built once and reused — see
+        # _get_template(). Only the three time-varying pieces below are
+        # constructed per item.
+        tpl = self._get_template()
+
         data = HeteroData()
+        for ntype in tpl.node_types:
+            data[ntype].x = tpl[ntype].x
+        for rel in tpl.edge_types:
+            data[rel].edge_index = tpl[rel].edge_index
+            if "edge_attr" in tpl[rel]:
+                data[rel].edge_attr = tpl[rel].edge_attr
 
-        for ntype, feat in self.static_x.items():
-            data[ntype].x = feat.clone()
+        # Overwrite Load features: static columns come from the template
+        # (already normalized), the kW column is normalized here with the
+        # same stats the old code applied to it.
+        kw_raw = torch.from_numpy(self._load_np[idx])
+        kw_t = kw_raw.unsqueeze(1)
+        if getattr(self, "norm_stats", None) is not None:
+            kw_mean, kw_std = self.norm_stats["load"]
+            kw_t = (kw_t - kw_mean[-1]) / kw_std[-1]
+        data["load"].x = torch.cat([tpl["load"].x[:, :-1], kw_t], dim=1)
 
-        # Overwrite Load features with this timestep's kW appended as an extra column
-        kw_t = torch.tensor(self.load_profiles.iloc[idx].values, dtype=torch.float).unsqueeze(1)
-        data["load"].x = torch.cat([self.static_x["load"], kw_t], dim=1)
+        # Real-time downstream demand per bus — the physical driver of line
+        # current, appended as two extra Bus features. See the matrix build
+        # in _fetch_static_graph and the stats in fit_normalization.
+        dkw = self.downstream_load_matrix @ kw_raw  # [n_bus]
+        if getattr(self, "norm_stats", None) is not None:
+            a_mean, a_std = self.norm_stats[("dkw_abs",)]
+            d_mean, d_std = self.norm_stats[("dkw_dev",)]
+            dkw_cols = torch.stack([(dkw - a_mean) / a_std, (dkw - d_mean) / d_std], dim=1)
+        else:
+            dkw_cols = torch.stack([dkw, dkw], dim=1)
+        data["bus"].x = torch.cat([tpl["bus"].x, dkw_cols], dim=1)
 
-        # Bus voltage labels for this timestep
-        v_t = torch.tensor(self.voltage_labels.iloc[idx].values, dtype=torch.float)
-        y = torch.where(self._bus_label_mask, v_t, torch.tensor(float("nan")))
-        data["bus"].y = y
+        # Bus voltage labels
+        v_t = torch.from_numpy(self._voltage_np[idx])
+        y_v = torch.where(self._bus_label_mask, v_t, torch.tensor(float("nan")))
+        data["bus"].y = y_v
         data["bus"].label_mask = self._bus_label_mask.clone()
 
-        for rel, ei in self.edge_index.items():
-            data[rel].edge_index = ei
-        for rel, ea in self.edge_attr.items():
-            data[rel].edge_attr = ea
-
-        # Apply z-score normalization if fit_normalization() has been called.
-        if getattr(self, "norm_stats", None) is not None:
-            for ntype in data.node_types:
-                mean, std = self.norm_stats[ntype]
-                data[ntype].x = (data[ntype].x - mean) / std
+        # Line current labels
+        line_rel = ("bus", "line_segment", "bus")
+        if getattr(self, "has_current_labels", False):
+            i_t = torch.from_numpy(self._current_np[idx])
+            y_i = torch.where(self._line_label_mask, i_t, torch.tensor(float("nan")))
+            # Per-line normalization, fit on the training split (see
+            # fit_normalization). Falls back to raw Amps if norm_stats
+            # hasn't been fit yet (e.g. before time_split() is called).
+            if getattr(self, "norm_stats", None) is not None and ("current_target",) in self.norm_stats:
+                i_mean, i_std = self.norm_stats[("current_target",)]
+                y_i = (y_i - i_mean) / i_std
+            data[line_rel].y = y_i
+            data[line_rel].label_mask = self._line_label_mask.clone()
 
         data["bus"].t = idx
         return data
@@ -337,8 +526,18 @@ if __name__ == "__main__":
     from torch_geometric.loader import DataLoader
     from torch_geometric.nn import HeteroConv, SAGEConv
 
-    class VoltageHeteroGNN(torch.nn.Module):
-        def __init__(self, metadata, in_dims, hidden=64):
+    # Set constant parameters
+    LAMBDA_CURRENT = 0.5
+    # Ablation: UPSTREAM_OF gives every bus a direct edge to every
+    # downstream bus. Current is very sensitive to real-time downstream
+    # demand, and with only 2 SAGEConv layers a line more than 2 hops from
+    # the loads it serves never receives that signal in time — this is a
+    # cheap way to test whether that's a limiting factor. Toggle to compare
+    # against the default (False).
+    INCLUDE_UPSTREAM = False
+
+    class FeederMultiTaskGNN(torch.nn.Module):
+        def __init__(self, metadata, in_dims, edge_attr_dim, hidden=64):
             super().__init__()
             self.lin_in = torch.nn.ModuleDict({
                 ntype: torch.nn.Linear(dim, hidden) for ntype, dim in in_dims.items()
@@ -349,44 +548,137 @@ if __name__ == "__main__":
             self.conv2 = HeteroConv({
                 rel: SAGEConv((-1, -1), hidden) for rel in metadata[1]
             }, aggr="sum")
-            self.out = torch.nn.Linear(hidden, 1)
 
-        def forward(self, x_dict, edge_index_dict):
-            x_dict = {k: F.relu(self.lin_in[k](v)) for k, v in x_dict.items()}
+            # Node task output (Voltage)
+            self.out_v = torch.nn.Linear(hidden, 1)
 
-            out1 = self.conv1(x_dict, edge_index_dict)
-            x_dict = {**x_dict, **out1}
-            x_dict = {k: F.relu(v) for k, v in x_dict.items()}
+            # Edge task output (Current) -> expects concatenated (src_emb, dst_emb, edge_attr)
+            self.out_i = torch.nn.Sequential(
+                torch.nn.Linear(hidden * 2 + edge_attr_dim, hidden),
+                torch.nn.ReLU(),
+                torch.nn.Linear(hidden, 1)
+            )
 
-            out2 = self.conv2(x_dict, edge_index_dict)
-            x_dict = {**x_dict, **out2}
+        def forward(self, x_dict, edge_index_dict, edge_attr_dict):
+            # Input projection
+            h_dict = {k: F.relu(self.lin_in[k](v)) for k, v in x_dict.items()}
 
-            return self.out(x_dict["bus"]).squeeze(-1)
+            # Message Passing Layer 1
+            out1 = self.conv1(h_dict, edge_index_dict)
+            h_dict = {**h_dict, **out1}
+            h_dict = {k: F.relu(v) for k, v in h_dict.items()}
+
+            # Message Passing Layer 2
+            out2 = self.conv2(h_dict, edge_index_dict)
+            h_dict = {**h_dict, **out2}
+
+            # Predict Bus Voltage
+            pred_v = self.out_v(h_dict["bus"]).squeeze(-1)
+
+            # Predict Line Current
+            line_rel = ("bus", "line_segment", "bus")
+            if line_rel in edge_index_dict:
+                src, dst = edge_index_dict[line_rel]
+                src_emb = h_dict["bus"][src]
+                dst_emb = h_dict["bus"][dst]
+                edge_attr = edge_attr_dict[line_rel]
+
+                edge_features = torch.cat([src_emb, dst_emb, edge_attr], dim=-1)
+                pred_i = self.out_i(edge_features).squeeze(-1)
+            else:
+                pred_i = None
+
+            return pred_v, pred_i
+
 
     ds = FeederHeteroSnapshotDataset(
         neo4j_uri=os.environ.get("NEO4J_URI"),
         neo4j_user=os.environ.get("NEO4J_USERNAME"),
         neo4j_password=os.environ.get("NEO4J_PASSWORD"),
         load_profiles_path=BASE_DIR / "data" / "Computed" / "load_profiles.csv",
-        voltage_labels_path=BASE_DIR / "data" / "Computed" / "bus_voltages.csv"
+        voltage_labels_path=BASE_DIR / "data" / "Computed" / "bus_voltages.csv",
+        current_labels_path=BASE_DIR / "data" / "Computed" / "line_currents.csv",
+        include_upstream=INCLUDE_UPSTREAM,
     )
     train_ds, val_ds, test_ds = ds.time_split()
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
 
     sample = ds[0]
     in_dims = {ntype: sample[ntype].x.size(1) for ntype in sample.node_types}
-    model = VoltageHeteroGNN(sample.metadata(), in_dims)
+    line_rel = ("bus", "line_segment", "bus")
+    edge_attr_dim = sample[line_rel].edge_attr.size(1)
+
+    model = FeederMultiTaskGNN(sample.metadata(), in_dims, edge_attr_dim)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Per-line current target stats, fit on the training split inside
+    # time_split() -> fit_normalization(). Used to un-normalize predictions
+    # back to real Amps for logging. The graph topology (and therefore line
+    # order) is identical across every snapshot, so repeating this vector
+    # by the number of graphs in a batch lines up with the batched edge order.
+    i_mean, i_std = ds.norm_stats[("current_target",)]
+
+    def evaluate(loader):
+        model.eval()
+        total_v, total_i, n = 0.0, 0.0, 0
+        with torch.no_grad():
+            for batch in loader:
+                pred_v, pred_i = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
+
+                mask_v = batch["bus"].label_mask
+                loss_v = F.mse_loss(pred_v[mask_v], batch["bus"].y[mask_v])
+
+                mask_i = batch[line_rel].label_mask
+                i_mean_b = i_mean.repeat(batch.num_graphs)[mask_i]
+                i_std_b = i_std.repeat(batch.num_graphs)[mask_i]
+                pred_i_real = pred_i[mask_i] * i_std_b + i_mean_b
+                y_i_real = batch[line_rel].y[mask_i] * i_std_b + i_mean_b
+                loss_i = F.mse_loss(pred_i_real, y_i_real)
+
+                total_v += loss_v.item() * batch.num_graphs
+                total_i += loss_i.item() * batch.num_graphs
+                n += batch.num_graphs
+        model.train()
+        return total_v / n, total_i / n
 
     for epoch in range(20):
         model.train()
-        total_loss = 0.0
+        total_loss_v = 0.0
+        total_loss_i = 0.0
+
         for batch in train_loader:
             opt.zero_grad()
-            pred = model(batch.x_dict, batch.edge_index_dict)
-            mask = batch["bus"].label_mask
-            loss = F.mse_loss(pred[mask], batch["bus"].y[mask])
+            pred_v, pred_i = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
+
+            # Loss for Voltage
+            mask_v = batch["bus"].label_mask
+            loss_v = F.mse_loss(pred_v[mask_v], batch["bus"].y[mask_v])
+
+            # Loss for Current — target is already per-line normalized by
+            # the dataset (see fit_normalization/get), so no separate
+            # global mean_i/std_i is needed here anymore.
+            mask_i = batch[line_rel].label_mask
+            loss_i = F.mse_loss(pred_i[mask_i], batch[line_rel].y[mask_i])
+
+            # Joint optimization
+            loss = loss_v + (LAMBDA_CURRENT * loss_i)
             loss.backward()
             opt.step()
-            total_loss += loss.item() * batch.num_graphs
-        print(f"epoch {epoch}: train MSE {total_loss / len(train_ds):.5f}")
+
+            # Track separately, current un-normalized back to real Amps for logging
+            total_loss_v += loss_v.item() * batch.num_graphs
+            with torch.no_grad():
+                i_mean_b = i_mean.repeat(batch.num_graphs)[mask_i]
+                i_std_b = i_std.repeat(batch.num_graphs)[mask_i]
+                pred_i_real = pred_i[mask_i] * i_std_b + i_mean_b
+                y_i_real = batch[line_rel].y[mask_i] * i_std_b + i_mean_b
+                real_mse_i = F.mse_loss(pred_i_real, y_i_real)
+                total_loss_i += real_mse_i.item() * batch.num_graphs
+
+        avg_loss_v = total_loss_v / len(train_ds)
+        avg_loss_i = total_loss_i / len(train_ds)
+        val_v, val_i = evaluate(val_loader)
+
+        print(f"epoch {epoch}: train MSE V {avg_loss_v:.5f} | train MSE I {avg_loss_i:.5f} "
+              f"| val MSE V {val_v:.5f} | val MSE I {val_i:.5f}")

@@ -1,0 +1,42 @@
+{
+  "voltage_vpu": {
+    "mae": 0.002989104778298216,
+    "rmse": 0.004049964663258811,
+    "max_absolute_error": 0.018693208694458008
+  },
+  "current_amperes": {
+    "mae": 2.142897200716745,
+    "rmse": 4.914122990422774,
+    "max_absolute_error": 61.1609787940979
+  },
+  "persistence_baseline": {
+    "voltage_vpu": {
+      "mae": 0.002966597976194108,
+      "rmse": 0.004395967488715565,
+      "max_absolute_error": 0.023787617683410645
+    },
+    "current_amperes": {
+      "mae": 1.8267485705777917,
+      "rmse": 5.112976649945172,
+      "max_absolute_error": 76.20156478881836
+    }
+  },
+  "training_fitted_trend_baseline": {
+    "voltage_vpu": {
+      "mae": 0.0028879569642716475,
+      "rmse": 0.004034081620198826,
+      "max_absolute_error": 0.019972801208496094
+    },
+    "current_amperes": {
+      "mae": 1.969072067345052,
+      "rmse": 4.699841812515945,
+      "max_absolute_error": 62.71793746948242
+    }
+  },
+  "rmse_improvement_over_persistence_percent": {
+    "voltage": 7.8709141126485145,
+    "current": 3.8891955339661206
+  },
+  "test_windows": 203,
+  "forecast_horizon": 15
+}

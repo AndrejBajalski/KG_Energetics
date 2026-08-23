@@ -31,7 +31,14 @@ import pandas as pd
 def parse_source_ini(path: Path) -> dict:
     """Source.csv is a small INI-style block: [Source]\nVoltage=11 kV\n..."""
     cp = configparser.ConfigParser()
-    cp.read(path)
+    # utf-8-sig accepts files saved with a UTF-8 BOM as well as ordinary UTF-8.
+    with path.open(encoding="utf-8-sig") as source_file:
+        cp.read_file(source_file, source=str(path))
+    if not cp.sections():
+        raise ValueError(
+            f"{path} must contain an INI section such as [Source]; "
+            "check that --data-dir points to data/European_LV_CSV."
+        )
     section = cp[cp.sections()[0]]
     # strip units like "11 kV" / "3000 A" down to the leading number
     def num(key, default=None):
@@ -225,8 +232,10 @@ def run_daily_simulation(dss, n_steps: int, step_minutes: int = 1):
 def main():
     import opendssdirect as dss
 
-    DATA_DIR = Path("../data/European_LV_CSV")
-    OUT_DIR = Path("../data/Computed")
+    # Resolve from this file so the script behaves the same from any cwd.
+    PROJECT_DIR = Path(__file__).resolve().parent.parent
+    DATA_DIR = PROJECT_DIR / "data" / "European_LV_CSV"
+    OUT_DIR = PROJECT_DIR / "data" / "Computed"
     N_STEPS = 1440
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)

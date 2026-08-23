@@ -1,1 +1,6 @@
 .env
+/temp
+scripts/__pycache__
+.vscode
+*.pt
+*.pyc

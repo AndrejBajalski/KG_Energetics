@@ -119,13 +119,40 @@ class FeederHeteroSnapshotDatasetWithCurrent(FeederHeteroSnapshotDataset):
 
         i_train = torch.tensor(
             self.line_current_labels.iloc[list(train_indices)].values, dtype=torch.float
-        )
-        # NaNs from unlabeled columns must not pollute the mean/std --
-        # mask them out the same way bus voltage handles missing columns.
-        valid_cols = self._line_label_mask
-        i_train_valid = i_train[:, valid_cols]
-        i_mean = i_train_valid.mean()
-        i_std = i_train_valid.std().clamp(min=1e-6)
+        )  # (T_train, num_line)
+
+        # PER-LINE normalization, not a single global scalar. A radial
+        # feeder's near-substation lines carry the sum of every downstream
+        # load's current, while tail lines carry just their own -- these
+        # can differ by 10-50x in raw amps. Pooling everything into one
+        # global mean/std would force very different-scale signals into
+        # the same normalized space, making the target impossible for a
+        # shared head to fit well. Mirrors the existing per-node-type
+        # normalization convention, just applied per-edge instead.
+        i_mean = i_train.mean(dim=0)                    # (num_line,)
+        raw_std = i_train.std(dim=0)                       # (num_line,), can be ~0 for near-flat lines
+
+        # A line whose current is nearly flat during the TRAIN window (e.g.
+        # it feeds a load with a near-constant profile in those hours) gets
+        # an almost-zero std. An absolute epsilon floor (1e-6) doesn't
+        # protect against this -- dividing by it blows up that line's
+        # z-scored target to enormous magnitude for any real fluctuation in
+        # val/test, and a handful of these can dominate the whole loss.
+        # Floor relative to the other lines' typical scale instead.
+        nonzero_std = raw_std[raw_std > 1e-6]
+        floor = nonzero_std.quantile(0.05).item() if nonzero_std.numel() > 0 else 1e-2
+        i_std = raw_std.clamp(min=floor)
+
+        n_clamped = int((raw_std < floor).sum().item())
+        if n_clamped:
+            print(f"NOTE: {n_clamped} lines had near-zero current variance in "
+                  f"the train split; their normalization std was floored to "
+                  f"{floor:.4g} (5th percentile of other lines' std) instead "
+                  f"of their own near-zero value.")
+
+        # Columns with no label (masked out) are all-NaN and will produce
+        # NaN mean/std here -- harmless, since those entries are always
+        # excluded via _line_label_mask before any loss/prediction uses them.
         self._current_norm_stats = (i_mean, i_std)
 
     # ------------------------------------------------------------------

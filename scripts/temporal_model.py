@@ -21,12 +21,13 @@ both the voltage and current heads. Other relations (supplies_power,
 conforms_to, has_feeder_head, feeds) have no edge_attr in your pipeline, so
 they stay plain SAGEConv, matching your existing code exactly.
 
-This depends on your installed torch_geometric version passing
-edge_attr_dict through HeteroConv.forward to relations whose conv accepts
-it (true for PyG >= ~2.0.4). If your version doesn't, set
-use_edge_attention=False in HeteroEncoder to fall back to your exact
-current behavior (edge_attr stored but unused), and everything else in
-this file still works unchanged.
+NOTE: this does its own per-relation forward loop instead of relying on
+torch_geometric's HeteroConv to forward edge_attr_dict. Some installed
+versions of HeteroConv pass an edge_attr kwarg to EVERY relation's conv
+uniformly, even SAGEConv ones that don't accept it at all (crashes with
+"SAGEConv.forward() got an unexpected keyword argument 'edge_attr'"). Doing
+the loop manually here sidesteps that entirely and works regardless of
+your torch_geometric version.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from typing import Dict, List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import HeteroConv, SAGEConv, TransformerConv
+from torch_geometric.nn import SAGEConv, TransformerConv
 
 LINE_REL = ("bus", "line_segment", "bus")
 
@@ -45,6 +46,8 @@ class HeteroEncoder(nn.Module):
     """
     Same shape as your VoltageHeteroGNN's lin_in/conv1/conv2, factored out
     so it can run once per snapshot inside a window with shared weights.
+    Aggregates multiple relations landing on the same destination node type
+    by summation, matching HeteroConv(aggr="sum")'s behavior.
     """
 
     def __init__(
@@ -59,29 +62,50 @@ class HeteroEncoder(nn.Module):
         self.lin_in = nn.ModuleDict({
             ntype: nn.Linear(dim, hidden) for ntype, dim in in_dims.items()
         })
-
-        def make_conv():
-            convs = {}
-            for rel in relations:
-                if use_edge_attention and rel == LINE_REL:
-                    convs[rel] = TransformerConv((-1, -1), hidden, edge_dim=edge_attr_dim)
-                else:
-                    convs[rel] = SAGEConv((-1, -1), hidden)
-            return HeteroConv(convs, aggr="sum")
-
-        self.conv1 = make_conv()
-        self.conv2 = make_conv()
-        self.hidden = hidden
+        self.relations = relations
         self.use_edge_attention = use_edge_attention
+        self.hidden = hidden
+
+        def make_convs():
+            convs = nn.ModuleDict()
+            for rel in relations:
+                key = "__".join(rel)
+                if use_edge_attention and rel == LINE_REL:
+                    convs[key] = TransformerConv((-1, -1), hidden, edge_dim=edge_attr_dim)
+                else:
+                    convs[key] = SAGEConv((-1, -1), hidden)
+            return convs
+
+        self.conv1 = make_convs()
+        self.conv2 = make_convs()
+
+    def _apply_layer(self, convs, x_dict, edge_index_dict, edge_attr_dict):
+        out = {ntype: [] for ntype in x_dict}
+        for rel in self.relations:
+            src_type, _, dst_type = rel
+            if rel not in edge_index_dict:
+                continue
+            conv = convs["__".join(rel)]
+            edge_index = edge_index_dict[rel]
+            x = (x_dict[src_type], x_dict[dst_type])
+
+            if self.use_edge_attention and rel == LINE_REL and edge_attr_dict is not None:
+                out_dst = conv(x, edge_index, edge_attr=edge_attr_dict[rel])
+            else:
+                out_dst = conv(x, edge_index)
+
+            out[dst_type].append(out_dst)
+
+        return {ntype: torch.stack(outs, dim=0).sum(dim=0)
+                for ntype, outs in out.items() if outs}
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
         x_dict = {k: F.relu(self.lin_in[k](v)) for k, v in x_dict.items()}
 
-        kwargs = {"edge_attr_dict": edge_attr_dict} if self.use_edge_attention else {}
-        out1 = self.conv1(x_dict, edge_index_dict, **kwargs)
+        out1 = self._apply_layer(self.conv1, x_dict, edge_index_dict, edge_attr_dict)
         x_dict = {**x_dict, **{k: F.relu(v) for k, v in out1.items()}}
 
-        out2 = self.conv2(x_dict, edge_index_dict, **kwargs)
+        out2 = self._apply_layer(self.conv2, x_dict, edge_index_dict, edge_attr_dict)
         x_dict = {**x_dict, **out2}
 
         return x_dict
@@ -143,13 +167,26 @@ class TemporalVoltageHeteroGNN(nn.Module):
         edge_index = last_graphs[0][LINE_REL].edge_index          # (2, num_lines), same topology for all
         edge_attr = torch.stack([g[LINE_REL].edge_attr for g in last_graphs])  # (B, num_lines, edge_attr_dim)
 
+        # The actual last-observed (normalized) current at the end of each
+        # window -- this is what a persistence forecast has direct access
+        # to, and what current_head previously didn't: it only saw bus
+        # embeddings + static edge_attr, never the raw current itself, so
+        # it had to reconstruct "what was the current a moment ago" purely
+        # indirectly before it could even match persistence. Predicting a
+        # delta from this instead of the absolute value gives the model
+        # persistence for free (delta=0 at init) and lets training focus
+        # on learning the deviation, a much easier target.
+        last_current = torch.stack([g[LINE_REL].y for g in last_graphs])  # (B, num_lines)
+
         bus_hidden = last_hidden.view(B, num_bus, self.hidden)
         src, dst = edge_index
         h_src = bus_hidden[:, src, :]                            # (B, num_lines, hidden)
         h_dst = bus_hidden[:, dst, :]                             # (B, num_lines, hidden)
 
         edge_in = torch.cat([h_src, h_dst, edge_attr], dim=-1)
-        current_pred = self.current_head(edge_in)                  # (B, num_lines, horizon)
+        current_delta = self.current_head(edge_in)                  # (B, num_lines, horizon)
+        current_pred = current_delta + last_current.unsqueeze(-1)     # broadcast persistence across horizon
+
         current_pred = current_pred.permute(0, 2, 1)                 # -> (B, horizon, num_lines)
 
         return voltage_pred, current_pred

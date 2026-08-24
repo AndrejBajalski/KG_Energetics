@@ -1,7 +1,7 @@
 """
 train_temporal.py
 
-Drop this alongside pyg_dataset.py in scripts/. Wires
+Drop this alongside hetero_gnn_dataset.py in scripts/. Wires
 FeederHeteroSnapshotDatasetWithCurrent + TemporalFeederWindowDataset +
 TemporalVoltageHeteroGNN together, using the same 70/15/15 chronological
 split convention as your existing time_split().
@@ -21,7 +21,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from pyg_dataset import BASE_DIR
+from hetero_gnn_dataset import BASE_DIR
 from temporal_dataset import (
     FeederHeteroSnapshotDatasetWithCurrent,
     TemporalFeederWindowDataset,

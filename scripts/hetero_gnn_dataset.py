@@ -1,5 +1,5 @@
 """
-pyg_dataset.py (HeteroData version - Multi-Task Extension)
+hetero_gnn_dataset.py (HeteroData version - Multi-Task Extension)
 
 Builds a heterogeneous graph snapshot dataset from the full Neo4j schema:
 node types {Bus, Load, LineCode, SubstationTransformer, Source} and edge
@@ -12,6 +12,7 @@ Requires: torch, torch_geometric, neo4j, pandas
 """
 
 import torch, os
+from collections import deque
 from pathlib import Path
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
@@ -343,15 +344,62 @@ class FeederHeteroSnapshotDataset(Dataset):
                 M[u, l_i] = 1.0
         self.downstream_load_matrix = M
 
+        # ---- Cumulative source-to-bus series impedance (static) ----
+        # LineCode impedance is per-unit-length, so a segment's series R, X is
+        # length*r1, length*x1. Summing these along the path from the source
+        # to a bus gives its ELECTRICAL distance from the substation — the
+        # quantity voltage drop scales with, and a far better position feature
+        # than the raw hop count already in the bus vector. O(n): one walk down
+        # the radial tree. This is topology only (no current), so it is an
+        # ingredient the model combines with real-time demand, not the answer.
+        #
+        # Paired with the downstream-demand feature, both factors of the
+        # dominant voltage-drop term (path impedance x demand) now live as
+        # per-bus features, so the MLP voltage head can form their product
+        # node-locally without needing extra message-passing reach.
+        n_bus = len(self.node_id["bus"])
+        seg_R, seg_X, children = {}, {}, {}
+        for r in line_rows_valid:
+            p = idx_of["bus"][r["src"]]
+            c = idx_of["bus"][r["dst"]]
+            children.setdefault(p, []).append(c)
+            seg_R[c] = r["length"] * r["r1"]
+            seg_X[c] = r["length"] * r["x1"]
+        cumR, cumX = [0.0] * n_bus, [0.0] * n_bus
+        # Roots = buses with no incoming line segment (fed by the transformer).
+        queue = deque(i for i in range(n_bus) if i not in seg_R)
+        visited = set(queue)
+        while queue:
+            u = queue.popleft()
+            for c in children.get(u, ()):
+                if c in visited:
+                    continue
+                cumR[c] = cumR[u] + seg_R.get(c, 0.0)
+                cumX[c] = cumX[u] + seg_X.get(c, 0.0)
+                visited.add(c)
+                queue.append(c)
+        cum_impedance = torch.tensor(list(zip(cumR, cumX)), dtype=torch.float)
+        # Append to the static Bus features (x, y, hops, cumKW -> + cumR, cumX).
+        self.static_x["bus"] = torch.cat([self.static_x["bus"], cum_impedance], dim=1)
+
         # Track line names aligned to edge_index for targets
         self.line_names = {
             ("bus", "line_segment", "bus"): [r["name"] for r in line_rows_valid]
         }
 
+        # Edge features: length, phase one-hot, per-unit-length impedance
+        # (r1/x1/r0/x0/c1/c0), and the ACTUAL series impedance of the segment
+        # length*r1, length*x1. LineCode gives impedance per unit length, so
+        # a segment's real impedance is length x that — the quantity that
+        # drives its voltage drop (V_drop ~ I*(R+jX)). Providing r1/x1 and
+        # length separately isn't enough for a linear edge encoder, which
+        # can't form their product; supplying length*r1 and length*x1
+        # directly hands the model the physical R and X per segment.
         self.edge_attr = {
             ("bus", "line_segment", "bus"): torch.tensor(
                 [[r["length"]] + _phase_onehot(r["phases"]) +
-                 [r["r1"], r["x1"], r["r0"], r["x0"], r["c1"], r["c0"]]
+                 [r["r1"], r["x1"], r["r0"], r["x0"], r["c1"], r["c0"],
+                  r["length"] * r["r1"], r["length"] * r["x1"]]
                  for r in line_rows_valid],
                 dtype=torch.float
             ),
@@ -439,6 +487,33 @@ class FeederHeteroSnapshotDataset(Dataset):
             i_std = i_var.sqrt().clamp(min=1e-6)
             self.norm_stats[("current_target",)] = (i_mean, i_std)
 
+        # Bus voltage TARGET normalization — per bus, same treatment the line
+        # currents already get. Raw per-unit voltage sits in a very narrow band
+        # (~0.98-1.05 across this feeder), so its MSE is numerically tiny —
+        # ~1e-4 — while the per-line-normalized current loss is ~1e-1. In the
+        # joint objective (loss_v + LAMBDA_CURRENT * loss_i) that put the two
+        # terms ~60:1 apart, so essentially all gradient into the shared conv
+        # layers was shaped by the current task and the voltage head was left
+        # to whatever fell out. Normalizing each bus by its own training-split
+        # mean/std puts both targets on a comparable scale, so LAMBDA_CURRENT
+        # means what it looks like and the voltage head competes for capacity.
+        #
+        # Per-bus (not global) for the same reason as current: it makes the
+        # target the bus's deviation from its own typical voltage, which is
+        # the time-varying part the model actually has to learn.
+        train_voltages = torch.tensor(
+            self.voltage_labels.iloc[list(train_indices)].values, dtype=torch.float
+        )  # [T_train, n_buses], NaN where a bus has no matching label column
+        v_valid = ~torch.isnan(train_voltages)
+        v_mean = torch.nan_to_num(train_voltages.nanmean(dim=0), nan=0.0)
+        v_centered = torch.where(v_valid, train_voltages - v_mean, torch.zeros_like(train_voltages))
+        v_var = (v_centered ** 2).sum(dim=0) / v_valid.sum(dim=0).clamp(min=1)
+        # Floor is defensive only: the smallest real per-bus std in this
+        # feeder is ~1.5e-4, so this never binds on labelled buses. It just
+        # stops an unlabelled/all-NaN column (std 0) producing a divide-by-zero.
+        v_std = v_var.sqrt().clamp(min=1e-6)
+        self.norm_stats[("voltage_target",)] = (v_mean, v_std)
+
     # ------------------------------------------------------------------
     def len(self):
         return self.n_timesteps
@@ -483,6 +558,12 @@ class FeederHeteroSnapshotDataset(Dataset):
         # Bus voltage labels
         v_t = torch.from_numpy(self._voltage_np[idx])
         y_v = torch.where(self._bus_label_mask, v_t, torch.tensor(float("nan")))
+        # Per-bus normalization, fit on the training split (see
+        # fit_normalization). Falls back to raw Vpu if norm_stats hasn't been
+        # fit yet (e.g. before time_split() is called).
+        if getattr(self, "norm_stats", None) is not None and ("voltage_target",) in self.norm_stats:
+            v_mean, v_std = self.norm_stats[("voltage_target",)]
+            y_v = (y_v - v_mean) / v_std
         data["bus"].y = y_v
         data["bus"].label_mask = self._bus_label_mask.clone()
 
@@ -518,167 +599,3 @@ class FeederHeteroSnapshotDataset(Dataset):
         return (torch.utils.data.Subset(self, train_idx),
                 torch.utils.data.Subset(self, val_idx),
                 torch.utils.data.Subset(self, test_idx))
-
-
-# Example training loop skeleton -----------------------------------------
-if __name__ == "__main__":
-    import torch.nn.functional as F
-    from torch_geometric.loader import DataLoader
-    from torch_geometric.nn import HeteroConv, SAGEConv
-
-    # Set constant parameters
-    LAMBDA_CURRENT = 0.5
-    # Ablation: UPSTREAM_OF gives every bus a direct edge to every
-    # downstream bus. Current is very sensitive to real-time downstream
-    # demand, and with only 2 SAGEConv layers a line more than 2 hops from
-    # the loads it serves never receives that signal in time — this is a
-    # cheap way to test whether that's a limiting factor. Toggle to compare
-    # against the default (False).
-    INCLUDE_UPSTREAM = False
-
-    class FeederMultiTaskGNN(torch.nn.Module):
-        def __init__(self, metadata, in_dims, edge_attr_dim, hidden=64):
-            super().__init__()
-            self.lin_in = torch.nn.ModuleDict({
-                ntype: torch.nn.Linear(dim, hidden) for ntype, dim in in_dims.items()
-            })
-            self.conv1 = HeteroConv({
-                rel: SAGEConv((-1, -1), hidden) for rel in metadata[1]
-            }, aggr="sum")
-            self.conv2 = HeteroConv({
-                rel: SAGEConv((-1, -1), hidden) for rel in metadata[1]
-            }, aggr="sum")
-
-            # Node task output (Voltage)
-            self.out_v = torch.nn.Linear(hidden, 1)
-
-            # Edge task output (Current) -> expects concatenated (src_emb, dst_emb, edge_attr)
-            self.out_i = torch.nn.Sequential(
-                torch.nn.Linear(hidden * 2 + edge_attr_dim, hidden),
-                torch.nn.ReLU(),
-                torch.nn.Linear(hidden, 1)
-            )
-
-        def forward(self, x_dict, edge_index_dict, edge_attr_dict):
-            # Input projection
-            h_dict = {k: F.relu(self.lin_in[k](v)) for k, v in x_dict.items()}
-
-            # Message Passing Layer 1
-            out1 = self.conv1(h_dict, edge_index_dict)
-            h_dict = {**h_dict, **out1}
-            h_dict = {k: F.relu(v) for k, v in h_dict.items()}
-
-            # Message Passing Layer 2
-            out2 = self.conv2(h_dict, edge_index_dict)
-            h_dict = {**h_dict, **out2}
-
-            # Predict Bus Voltage
-            pred_v = self.out_v(h_dict["bus"]).squeeze(-1)
-
-            # Predict Line Current
-            line_rel = ("bus", "line_segment", "bus")
-            if line_rel in edge_index_dict:
-                src, dst = edge_index_dict[line_rel]
-                src_emb = h_dict["bus"][src]
-                dst_emb = h_dict["bus"][dst]
-                edge_attr = edge_attr_dict[line_rel]
-
-                edge_features = torch.cat([src_emb, dst_emb, edge_attr], dim=-1)
-                pred_i = self.out_i(edge_features).squeeze(-1)
-            else:
-                pred_i = None
-
-            return pred_v, pred_i
-
-
-    ds = FeederHeteroSnapshotDataset(
-        neo4j_uri=os.environ.get("NEO4J_URI"),
-        neo4j_user=os.environ.get("NEO4J_USERNAME"),
-        neo4j_password=os.environ.get("NEO4J_PASSWORD"),
-        load_profiles_path=BASE_DIR / "data" / "Computed" / "load_profiles.csv",
-        voltage_labels_path=BASE_DIR / "data" / "Computed" / "bus_voltages.csv",
-        current_labels_path=BASE_DIR / "data" / "Computed" / "line_currents.csv",
-        include_upstream=INCLUDE_UPSTREAM,
-    )
-    train_ds, val_ds, test_ds = ds.time_split()
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
-
-    sample = ds[0]
-    in_dims = {ntype: sample[ntype].x.size(1) for ntype in sample.node_types}
-    line_rel = ("bus", "line_segment", "bus")
-    edge_attr_dim = sample[line_rel].edge_attr.size(1)
-
-    model = FeederMultiTaskGNN(sample.metadata(), in_dims, edge_attr_dim)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    # Per-line current target stats, fit on the training split inside
-    # time_split() -> fit_normalization(). Used to un-normalize predictions
-    # back to real Amps for logging. The graph topology (and therefore line
-    # order) is identical across every snapshot, so repeating this vector
-    # by the number of graphs in a batch lines up with the batched edge order.
-    i_mean, i_std = ds.norm_stats[("current_target",)]
-
-    def evaluate(loader):
-        model.eval()
-        total_v, total_i, n = 0.0, 0.0, 0
-        with torch.no_grad():
-            for batch in loader:
-                pred_v, pred_i = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
-
-                mask_v = batch["bus"].label_mask
-                loss_v = F.mse_loss(pred_v[mask_v], batch["bus"].y[mask_v])
-
-                mask_i = batch[line_rel].label_mask
-                i_mean_b = i_mean.repeat(batch.num_graphs)[mask_i]
-                i_std_b = i_std.repeat(batch.num_graphs)[mask_i]
-                pred_i_real = pred_i[mask_i] * i_std_b + i_mean_b
-                y_i_real = batch[line_rel].y[mask_i] * i_std_b + i_mean_b
-                loss_i = F.mse_loss(pred_i_real, y_i_real)
-
-                total_v += loss_v.item() * batch.num_graphs
-                total_i += loss_i.item() * batch.num_graphs
-                n += batch.num_graphs
-        model.train()
-        return total_v / n, total_i / n
-
-    for epoch in range(20):
-        model.train()
-        total_loss_v = 0.0
-        total_loss_i = 0.0
-
-        for batch in train_loader:
-            opt.zero_grad()
-            pred_v, pred_i = model(batch.x_dict, batch.edge_index_dict, batch.edge_attr_dict)
-
-            # Loss for Voltage
-            mask_v = batch["bus"].label_mask
-            loss_v = F.mse_loss(pred_v[mask_v], batch["bus"].y[mask_v])
-
-            # Loss for Current — target is already per-line normalized by
-            # the dataset (see fit_normalization/get), so no separate
-            # global mean_i/std_i is needed here anymore.
-            mask_i = batch[line_rel].label_mask
-            loss_i = F.mse_loss(pred_i[mask_i], batch[line_rel].y[mask_i])
-
-            # Joint optimization
-            loss = loss_v + (LAMBDA_CURRENT * loss_i)
-            loss.backward()
-            opt.step()
-
-            # Track separately, current un-normalized back to real Amps for logging
-            total_loss_v += loss_v.item() * batch.num_graphs
-            with torch.no_grad():
-                i_mean_b = i_mean.repeat(batch.num_graphs)[mask_i]
-                i_std_b = i_std.repeat(batch.num_graphs)[mask_i]
-                pred_i_real = pred_i[mask_i] * i_std_b + i_mean_b
-                y_i_real = batch[line_rel].y[mask_i] * i_std_b + i_mean_b
-                real_mse_i = F.mse_loss(pred_i_real, y_i_real)
-                total_loss_i += real_mse_i.item() * batch.num_graphs
-
-        avg_loss_v = total_loss_v / len(train_ds)
-        avg_loss_i = total_loss_i / len(train_ds)
-        val_v, val_i = evaluate(val_loader)
-
-        print(f"epoch {epoch}: train MSE V {avg_loss_v:.5f} | train MSE I {avg_loss_i:.5f} "
-              f"| val MSE V {val_v:.5f} | val MSE I {val_i:.5f}")

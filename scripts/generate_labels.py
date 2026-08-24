@@ -69,7 +69,7 @@ def build_load_profiles(data_dir: Path, profiles_subdir: str = "Load_Profiles") 
     """
     Consolidates the raw per-load Load_profile_N.csv files into one wide
     DataFrame: rows = timestep, columns = Load names, values = kW at that
-    minute. This is what pyg_dataset.py reads as the per-timestep dynamic
+    minute. This is what hetero_gnn_dataset.py reads as the per-timestep dynamic
     node features for Load nodes.
 
     Requires Loads.csv (Name, Yearly, kW, ...) and LoadShapes.csv

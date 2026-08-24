@@ -8,7 +8,7 @@ the same forecasting framing as train_temporal.py:
     of bus voltage and line current.
 
 Voltage phase columns are collapsed to one conservative target per bus by
-taking the minimum phase voltage, matching pyg_dataset.py. SourceBus is
+taking the minimum phase voltage, matching hetero_gnn_dataset.py. SourceBus is
 excluded because the graph models represent it as a Source rather than a Bus.
 """
 
@@ -69,7 +69,7 @@ def _collapse_phase_voltages(raw: pd.DataFrame) -> pd.DataFrame:
         bus_name = str(column).split(".")[0]
         columns_by_bus.setdefault(bus_name, []).append(column)
 
-    # Match the deterministic ordering used by pyg_dataset.py.
+    # Match the deterministic ordering used by hetero_gnn_dataset.py.
     ordered_buses = sorted(columns_by_bus, key=lambda name: (len(name), name))
     collapsed = {
         bus_name: raw[columns_by_bus[bus_name]].min(axis=1)

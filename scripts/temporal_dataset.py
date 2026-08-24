@@ -1,7 +1,7 @@
 """
 temporal_dataset.py
 
-Two additions on top of your existing pyg_dataset.py:
+Two additions on top of your existing hetero_gnn_dataset.py:
 
 1. FeederHeteroSnapshotDatasetWithCurrent -- subclasses
    FeederHeteroSnapshotDataset to also load line_currents.csv and attach
@@ -36,7 +36,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch_geometric.data import HeteroData, Batch
 
-from pyg_dataset import FeederHeteroSnapshotDataset, _phase_onehot
+from hetero_gnn_dataset import FeederHeteroSnapshotDataset, _phase_onehot
 
 
 class FeederHeteroSnapshotDatasetWithCurrent(FeederHeteroSnapshotDataset):

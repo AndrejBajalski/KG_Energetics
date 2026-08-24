@@ -1,7 +1,7 @@
 """
 temporal_model.py
 
-Extends your existing VoltageHeteroGNN (pyg_dataset.py __main__: lin_in ->
+Extends your existing VoltageHeteroGNN (hetero_gnn_dataset.py __main__: lin_in ->
 conv1 -> conv2 -> out) with:
 
   1. A shared per-timestep encoder run across a window of W snapshots,
@@ -13,7 +13,7 @@ conv1 -> conv2 -> out) with:
 IMPORTANT existing-code note: your current conv1/conv2 use plain SAGEConv,
 which only takes (x_dict, edge_index_dict) -- it never sees edge_attr, so
 the impedance values (r1,x1,r0,x0,c1,c0) you fold into line_segment edges
-(pyg_dataset.py, CONFORMS_TO join) are stored but currently invisible to
+(hetero_gnn_dataset.py, CONFORMS_TO join) are stored but currently invisible to
 message passing for the *voltage* prediction. This file swaps the
 line_segment relation to TransformerConv(edge_dim=...), which does consume
 edge_attr, so impedance actually influences the Bus embeddings now -- for
@@ -196,7 +196,7 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> 
     """Same convention as your existing label_mask / __main__ training loop
     (`loss = F.mse_loss(pred[mask], batch["bus"].y[mask])`): select via
     boolean indexing rather than multiplying by a 0/1 mask. Unlabeled
-    targets are stored as NaN (see pyg_dataset.py's torch.where pattern),
+    targets are stored as NaN (see hetero_gnn_dataset.py's torch.where pattern),
     and NaN * 0 is still NaN in IEEE float -- multiplying would silently
     poison the loss instead of excluding those entries."""
     mask = mask.bool()

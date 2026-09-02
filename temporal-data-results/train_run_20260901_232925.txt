@@ -1,0 +1,18 @@
+Run started 20260901_232925 | device=cuda | window=30 horizon=15 hidden=64 batch_size=8 lambda_current=0.3 epochs=20
+epoch 00 | train V-MSE 0.066788 V-R2 -1400.4210 I-MSE 0.722338 I-R2 0.0519 | val V-MSE 0.000339 V-R2 -11.1069 I-MSE 1.318941 I-R2 0.2334  <- best so far, checkpointed
+epoch 01 | train V-MSE 0.000551 V-R2 -10.5716 I-MSE 0.688008 I-R2 0.0969 | val V-MSE 0.000827 V-R2 -28.5761 I-MSE 1.180385 I-R2 0.3139  <- best so far, checkpointed
+epoch 02 | train V-MSE 0.000572 V-R2 -11.0016 I-MSE 0.604928 I-R2 0.2060 | val V-MSE 0.001376 V-R2 -48.2095 I-MSE 1.232975 I-R2 0.2834
+epoch 03 | train V-MSE 0.000325 V-R2 -5.8224 I-MSE 0.560495 I-R2 0.2643 | val V-MSE 0.000690 V-R2 -23.6904 I-MSE 1.143659 I-R2 0.3353  <- best so far, checkpointed
+epoch 04 | train V-MSE 0.000327 V-R2 -5.8576 I-MSE 0.537597 I-R2 0.2944 | val V-MSE 0.001171 V-R2 -40.8638 I-MSE 1.207724 I-R2 0.2980
+epoch 05 | train V-MSE 0.000262 V-R2 -4.4908 I-MSE 0.519710 I-R2 0.3178 | val V-MSE 0.001751 V-R2 -61.6130 I-MSE 1.302742 I-R2 0.2428
+epoch 06 | train V-MSE 0.000302 V-R2 -5.3421 I-MSE 0.511063 I-R2 0.3292 | val V-MSE 0.002213 V-R2 -78.1325 I-MSE 1.512150 I-R2 0.1211
+epoch 07 | train V-MSE 0.000246 V-R2 -4.1637 I-MSE 0.498251 I-R2 0.3460 | val V-MSE 0.001595 V-R2 -56.0405 I-MSE 1.567537 I-R2 0.0889
+epoch 08 | train V-MSE 0.000222 V-R2 -3.6594 I-MSE 0.492550 I-R2 0.3535 | val V-MSE 0.001856 V-R2 -65.3717 I-MSE 1.561583 I-R2 0.0924
+epoch 09 | train V-MSE 0.000260 V-R2 -4.4581 I-MSE 0.488325 I-R2 0.3590 | val V-MSE 0.001327 V-R2 -46.4417 I-MSE 1.402158 I-R2 0.1850
+epoch 10 | train V-MSE 0.000528 V-R2 -10.0833 I-MSE 0.484443 I-R2 0.3641 | val V-MSE 0.002376 V-R2 -83.9822 I-MSE 1.878538 I-R2 -0.0918
+epoch 11 | train V-MSE 0.000278 V-R2 -4.8345 I-MSE 0.484659 I-R2 0.3639 | val V-MSE 0.002603 V-R2 -92.0933 I-MSE 1.683351 I-R2 0.0216
+No val improvement for 8 epochs, stopping early at epoch 11 (best was epoch 3).
+
+Best val checkpoint: epoch 3 (val V-MSE + 0.3*I-MSE = 0.343788)
+
+FINAL TEST (best-val checkpoint from epoch 3, held out through all of training) | V-MSE 0.000471 V-R2 -15.9869 I-MSE 0.769343 I-R2 0.3949

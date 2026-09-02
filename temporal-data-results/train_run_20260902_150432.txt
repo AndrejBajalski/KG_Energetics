@@ -1,0 +1,17 @@
+Run started 20260902_150432 | device=cuda | window=30 horizon=15 hidden=64 batch_size=8 lambda_current=0.3 epochs=20
+epoch 00 | train V-MSE 0.053131 V-R2 -1113.8655 I-MSE 0.719766 I-R2 0.0553 | val V-MSE 0.001139 V-R2 -39.7310 I-MSE 1.289976 I-R2 0.2502  <- best so far, checkpointed
+epoch 01 | train V-MSE 0.000736 V-R2 -14.4455 I-MSE 0.641581 I-R2 0.1579 | val V-MSE 0.000690 V-R2 -23.6634 I-MSE 1.309718 I-R2 0.2388
+epoch 02 | train V-MSE 0.000508 V-R2 -9.6641 I-MSE 0.576241 I-R2 0.2436 | val V-MSE 0.000922 V-R2 -31.9584 I-MSE 1.280696 I-R2 0.2556  <- best so far, checkpointed
+epoch 03 | train V-MSE 0.000318 V-R2 -5.6716 I-MSE 0.535519 I-R2 0.2971 | val V-MSE 0.001065 V-R2 -37.0744 I-MSE 1.289774 I-R2 0.2504
+epoch 04 | train V-MSE 0.000302 V-R2 -5.3435 I-MSE 0.518688 I-R2 0.3192 | val V-MSE 0.001360 V-R2 -47.6414 I-MSE 1.312001 I-R2 0.2374
+epoch 05 | train V-MSE 0.000265 V-R2 -4.5662 I-MSE 0.522866 I-R2 0.3137 | val V-MSE 0.001171 V-R2 -40.8816 I-MSE 1.285419 I-R2 0.2529
+epoch 06 | train V-MSE 0.000235 V-R2 -3.9215 I-MSE 0.503537 I-R2 0.3391 | val V-MSE 0.001301 V-R2 -45.5151 I-MSE 1.281269 I-R2 0.2553
+epoch 07 | train V-MSE 0.000258 V-R2 -4.4224 I-MSE 0.496004 I-R2 0.3490 | val V-MSE 0.001226 V-R2 -42.8369 I-MSE 1.353103 I-R2 0.2136
+epoch 08 | train V-MSE 0.000231 V-R2 -3.8407 I-MSE 0.490964 I-R2 0.3556 | val V-MSE 0.001201 V-R2 -41.9310 I-MSE 1.424190 I-R2 0.1722
+epoch 09 | train V-MSE 0.000222 V-R2 -3.6642 I-MSE 0.485638 I-R2 0.3626 | val V-MSE 0.001628 V-R2 -57.2104 I-MSE 1.512284 I-R2 0.1210
+epoch 10 | train V-MSE 0.000221 V-R2 -3.6336 I-MSE 0.480800 I-R2 0.3689 | val V-MSE 0.001297 V-R2 -45.3885 I-MSE 1.752449 I-R2 -0.0186
+No val improvement for 8 epochs, stopping early at epoch 10 (best was epoch 2).
+
+Best val checkpoint: epoch 2 (val V-MSE + 0.3*I-MSE = 0.385130)
+
+FINAL TEST (best-val checkpoint from epoch 2, held out through all of training) | V-MSE 0.000694 V-R2 -24.0388 I-MSE 0.796533 I-R2 0.3736

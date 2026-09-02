@@ -41,7 +41,7 @@ class CSVTimeSeries:
 
 @dataclass
 class FeatureStandardizer:
-    """Per-feature mean/std fitted on training timesteps only."""
+    """Per-feature affine transform fitted on training timesteps only."""
 
     mean: torch.Tensor
     std: torch.Tensor
@@ -53,6 +53,16 @@ class FeatureStandardizer:
         mean = train_values.mean(dim=0)
         std = train_values.std(dim=0, unbiased=False).clamp(min=1e-6)
         return cls(mean=mean, std=std)
+
+    @classmethod
+    def identity(cls, values: torch.Tensor) -> "FeatureStandardizer":
+        """Return a no-op transform that keeps values in their original units."""
+
+        feature_count = values.size(-1)
+        return cls(
+            mean=values.new_zeros(feature_count),
+            std=values.new_ones(feature_count),
+        )
 
     def transform(self, values: torch.Tensor) -> torch.Tensor:
         return (values - self.mean) / self.std
@@ -190,11 +200,18 @@ class LSTMForecastWindowDataset(Dataset):
 def fit_standardizers(
     data: CSVTimeSeries,
     train_range: tuple[int, int],
+    enabled: bool = True,
 ) -> tuple[FeatureStandardizer, FeatureStandardizer, FeatureStandardizer]:
-    """Fit input and target scaling exclusively on the training interval."""
+    """Fit training-only scaling, or return identity transforms when disabled."""
 
+    if enabled:
+        return (
+            FeatureStandardizer.fit(data.loads, train_range),
+            FeatureStandardizer.fit(data.voltages, train_range),
+            FeatureStandardizer.fit(data.currents, train_range),
+        )
     return (
-        FeatureStandardizer.fit(data.loads, train_range),
-        FeatureStandardizer.fit(data.voltages, train_range),
-        FeatureStandardizer.fit(data.currents, train_range),
+        FeatureStandardizer.identity(data.loads),
+        FeatureStandardizer.identity(data.voltages),
+        FeatureStandardizer.identity(data.currents),
     )

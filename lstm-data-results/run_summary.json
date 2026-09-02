@@ -1,44 +1,56 @@
 {
   "best_epoch": 6,
-  "best_validation_total_loss": 1.1311776980315105,
+  "best_validation_total_loss": 0.41342561197752997,
   "test_metrics": {
     "voltage_vpu": {
-      "mae": 0.002989104778298216,
-      "rmse": 0.004049964663258811,
-      "max_absolute_error": 0.018693208694458008
+      "mae": 0.0031329177621643497,
+      "mse": 1.7575937672943482e-05,
+      "rmse": 0.004192366595724124,
+      "r2": 0.3660149522604089,
+      "max_absolute_error": 0.0185239315032959
     },
     "current_amperes": {
-      "mae": 2.142897200716745,
-      "rmse": 4.914122990422774,
-      "max_absolute_error": 61.1609787940979
+      "mae": 2.1729433022236706,
+      "mse": 25.026476715822966,
+      "rmse": 5.002646970936783,
+      "r2": 0.8306423032683115,
+      "max_absolute_error": 64.03670883178711
     },
     "persistence_baseline": {
       "voltage_vpu": {
         "mae": 0.002966597976194108,
+        "mse": 1.9324530161844235e-05,
         "rmse": 0.004395967488715565,
+        "r2": 0.30294113434061776,
         "max_absolute_error": 0.023787617683410645
       },
       "current_amperes": {
         "mae": 1.8267485705777917,
+        "mse": 26.142530222884552,
         "rmse": 5.112976649945172,
+        "r2": 0.8230898118196941,
         "max_absolute_error": 76.20156478881836
       }
     },
     "training_fitted_trend_baseline": {
       "voltage_vpu": {
         "mae": 0.0028879569642716475,
+        "mse": 1.6273814518425978e-05,
         "rmse": 0.004034081620198826,
+        "r2": 0.4129840884533773,
         "max_absolute_error": 0.019972801208496094
       },
       "current_amperes": {
         "mae": 1.969072067345052,
+        "mse": 22.088513062673165,
         "rmse": 4.699841812515945,
+        "r2": 0.850523917569388,
         "max_absolute_error": 62.71793746948242
       }
     },
     "rmse_improvement_over_persistence_percent": {
-      "voltage": 7.8709141126485145,
-      "current": 3.8891955339661206
+      "voltage": 4.631537733481515,
+      "current": 2.1578365512303344
     },
     "test_windows": 203,
     "forecast_horizon": 15

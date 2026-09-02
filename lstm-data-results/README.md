@@ -5,14 +5,19 @@ model uses the previous 30 minutes of load, bus-voltage, and line-current CSV
 observations to forecast the next 15 minutes. It does not use Neo4j.
 
 The current architecture uses training-only PCA bases (16 voltage components
-and 64 current components), a two-layer LSTM, and residual forecasts around a
-training-fitted trend baseline. This keeps feeder-wide predictions spatially
-coherent and reduces overfitting compared with independent output heads.
+and 64 current components), a one-layer LSTM with a 128-dimensional hidden
+state, and residual forecasts around a training-fitted trend baseline. This
+keeps feeder-wide predictions spatially coherent and reduces overfitting
+compared with independent output heads.
+
+See [`docs/CSV_ONLY_LSTM_MODEL.md`](../docs/CSV_ONLY_LSTM_MODEL.md) for the
+complete data, preprocessing, architecture, training, and evaluation guide.
 
 Expected outputs after a completed run:
 
 - `config.json`: model, split, and training configuration.
-- `training_history.csv`: normalized train and validation losses by epoch.
+- `training_history.csv`: train and validation losses in the configured model
+  data space by epoch.
 - `best_model.pt`: best validation checkpoint, scalers, and column names.
 - `test_metrics.json`: held-out model, persistence-baseline, and trend-baseline
   metrics in Vpu/A.
@@ -28,4 +33,6 @@ Run from the project root with:
 python scripts/train_lstm.py
 ```
 
-All normalization, PCA, and trend statistics are fitted on training data only.
+Set `NORMALIZE_DATA` in `scripts/train_lstm.py` to choose per-feature training
+standardization (`True`) or original CSV units (`False`). When enabled, all
+normalization, PCA, and trend statistics are fitted on training data only.

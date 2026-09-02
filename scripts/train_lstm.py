@@ -37,22 +37,26 @@ RESULTS_DIR = BASE_DIR / "lstm-data-results"
 
 WINDOW = 30
 HORIZON = 15
-HIDDEN = 192
-LSTM_LAYERS = 2
-DROPOUT = 0.1
+HIDDEN = 128
+LSTM_LAYERS = 1
+DROPOUT = 0.2
 BATCH_SIZE = 32
 EPOCHS = 100
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-5
-LAMBDA_CURRENT = 0.3
+LEARNING_RATE = 17e-5
+WEIGHT_DECAY = 1e-4
+LAMBDA_VOLTAGE = 0.7
+LAMBDA_CURRENT = 1.0
+LOSS_FUNCTION = "huber"
+HUBER_DELTA = 1.0
 EARLY_STOPPING_PATIENCE = 20
-LR_PATIENCE = 8
+LR_PATIENCE = 5
 LR_FACTOR = 0.5
 MIN_LEARNING_RATE = 1e-5
 GRAD_CLIP_NORM = 1.0
 TREND_COEFFICIENT_CLIP = 20.0
 VOLTAGE_PCA_COMPONENTS = 16
 CURRENT_PCA_COMPONENTS = 64
+NORMALIZE_DATA = True
 TRAIN_FRAC = 0.7
 VAL_FRAC = 0.15
 SEED = 42
@@ -64,6 +68,18 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def forecast_loss(
+    prediction: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Configured objective in the selected scaled or raw model space."""
+
+    if LOSS_FUNCTION == "huber":
+        return F.huber_loss(prediction, target, delta=HUBER_DELTA)
+    if LOSS_FUNCTION == "mse":
+        return F.mse_loss(prediction, target)
+    raise ValueError(f"unsupported loss function: {LOSS_FUNCTION}")
 
 
 def make_loader(
@@ -80,7 +96,7 @@ def make_loader(
     )
 
 
-def evaluate_normalized(
+def evaluate_model_space(
     model: CSVForecastLSTM,
     loader: DataLoader,
     device: torch.device,
@@ -100,9 +116,12 @@ def evaluate_normalized(
                 load_history, voltage_history, current_history
             )
 
-            voltage_loss = F.mse_loss(voltage_pred, voltage_target)
-            current_loss = F.mse_loss(current_pred, current_target)
-            total_loss = voltage_loss + LAMBDA_CURRENT * current_loss
+            voltage_loss = forecast_loss(voltage_pred, voltage_target)
+            current_loss = forecast_loss(current_pred, current_target)
+            total_loss = (
+                LAMBDA_VOLTAGE * voltage_loss
+                + LAMBDA_CURRENT * current_loss
+            )
 
             batch_size = load_history.size(0)
             sums["total"] += total_loss.item() * batch_size
@@ -184,10 +203,23 @@ def save_checkpoint(
 
 
 def regression_metrics(prediction: np.ndarray, target: np.ndarray) -> dict[str, float]:
-    difference = prediction.astype(np.float64) - target.astype(np.float64)
+    prediction_64 = prediction.astype(np.float64)
+    target_64 = target.astype(np.float64)
+    difference = prediction_64 - target_64
+    squared_error = np.square(difference)
+    mse = float(np.mean(squared_error))
+    target_deviation = target_64 - np.mean(target_64)
+    total_sum_of_squares = float(np.sum(np.square(target_deviation)))
+    r2 = (
+        float(1.0 - np.sum(squared_error) / total_sum_of_squares)
+        if total_sum_of_squares > 0.0
+        else float("nan")
+    )
     return {
         "mae": float(np.mean(np.abs(difference))),
-        "rmse": float(np.sqrt(np.mean(np.square(difference)))),
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "r2": r2,
         "max_absolute_error": float(np.max(np.abs(difference))),
     }
 
@@ -291,10 +323,14 @@ def save_test_results(
             {
                 "horizon_minute": horizon_index + 1,
                 "voltage_mae_vpu": voltage_metrics["mae"],
+                "voltage_mse_vpu_squared": voltage_metrics["mse"],
                 "voltage_rmse_vpu": voltage_metrics["rmse"],
+                "voltage_r2": voltage_metrics["r2"],
                 "voltage_max_abs_error_vpu": voltage_metrics["max_absolute_error"],
                 "current_mae_a": current_metrics["mae"],
+                "current_mse_a_squared": current_metrics["mse"],
                 "current_rmse_a": current_metrics["rmse"],
+                "current_r2": current_metrics["r2"],
                 "current_max_abs_error_a": current_metrics["max_absolute_error"],
             }
         )
@@ -309,8 +345,8 @@ def save_test_results(
     trend_voltage_metrics = regression_metrics(trend_voltage, voltage_true)
     trend_current_metrics = regression_metrics(trend_current, current_true)
     overall = {
-        "voltage_vpu": regression_metrics(voltage_pred, voltage_true),
-        "current_amperes": regression_metrics(current_pred, current_true),
+        "voltage_vpu": model_voltage_metrics,
+        "current_amperes": model_current_metrics,
         "persistence_baseline": {
             "voltage_vpu": baseline_voltage_metrics,
             "current_amperes": baseline_current_metrics,
@@ -371,15 +407,17 @@ def main() -> None:
     val_range = (n_train, n_train + n_val)
     test_range = (n_train + n_val, n)
 
-    load_scaler, voltage_scaler, current_scaler = fit_standardizers(data, train_range)
-    normalized_loads = load_scaler.transform(data.loads)
-    normalized_voltages = voltage_scaler.transform(data.voltages)
-    normalized_currents = current_scaler.transform(data.currents)
+    load_scaler, voltage_scaler, current_scaler = fit_standardizers(
+        data, train_range, enabled=NORMALIZE_DATA
+    )
+    model_loads = load_scaler.transform(data.loads)
+    model_voltages = voltage_scaler.transform(data.voltages)
+    model_currents = current_scaler.transform(data.currents)
 
     dataset_args = {
-        "normalized_loads": normalized_loads,
-        "normalized_voltages": normalized_voltages,
-        "normalized_currents": normalized_currents,
+        "normalized_loads": model_loads,
+        "normalized_voltages": model_voltages,
+        "normalized_currents": model_currents,
         "window": WINDOW,
         "horizon": HORIZON,
     }
@@ -400,19 +438,19 @@ def main() -> None:
         lstm_layers=LSTM_LAYERS,
         dropout=DROPOUT,
         voltage_basis=fit_spatial_basis(
-            normalized_voltages, train_range, VOLTAGE_PCA_COMPONENTS
+            model_voltages, train_range, VOLTAGE_PCA_COMPONENTS
         ),
         current_basis=fit_spatial_basis(
-            normalized_currents, train_range, CURRENT_PCA_COMPONENTS
+            model_currents, train_range, CURRENT_PCA_COMPONENTS
         ),
         voltage_trend_coefficients=fit_trend_coefficients(
-            normalized_voltages,
+            model_voltages,
             train_dataset.valid_t,
             WINDOW,
             HORIZON,
         ),
         current_trend_coefficients=fit_trend_coefficients(
-            normalized_currents,
+            model_currents,
             train_dataset.valid_t,
             WINDOW,
             HORIZON,
@@ -439,7 +477,13 @@ def main() -> None:
         "epochs": EPOCHS,
         "learning_rate": LEARNING_RATE,
         "weight_decay": WEIGHT_DECAY,
+        "normalize_data": NORMALIZE_DATA,
+        "model_data_space": "standardized" if NORMALIZE_DATA else "raw_csv_units",
+        "loss_function": LOSS_FUNCTION,
+        "huber_delta_model_space": HUBER_DELTA,
+        "lambda_voltage": LAMBDA_VOLTAGE,
         "lambda_current": LAMBDA_CURRENT,
+        "checkpoint_requires_both_heads_to_beat_trend": True,
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
         "lr_scheduler_patience": LR_PATIENCE,
         "lr_scheduler_factor": LR_FACTOR,
@@ -477,7 +521,7 @@ def main() -> None:
     # The zero-initialized residual heads make epoch 0 the training-fitted
     # trend baseline. Save it before optimization so training can never
     # select a checkpoint that validates worse than this baseline.
-    initial_val_metrics = evaluate_normalized(model, val_loader, device)
+    initial_val_metrics = evaluate_model_space(model, val_loader, device)
     best_val_loss = initial_val_metrics["total"]
     best_epoch = 0
     stale_epochs = 0
@@ -495,11 +539,12 @@ def main() -> None:
     print(
         f"device={device} | train/val/test windows="
         f"{len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)} | "
-        f"parameters={config['trainable_parameters']:,}"
+        f"parameters={config['trainable_parameters']:,} | "
+        f"data_space={config['model_data_space']}"
     )
     print(
-        f"epoch 000 trend baseline | val V-MSE {initial_val_metrics['voltage']:.6f} "
-        f"I-MSE {initial_val_metrics['current']:.6f}"
+        f"epoch 000 trend baseline | val V-loss {initial_val_metrics['voltage']:.6f} "
+        f"I-loss {initial_val_metrics['current']:.6f}"
     )
 
     for epoch in range(1, EPOCHS + 1):
@@ -518,9 +563,12 @@ def main() -> None:
             voltage_pred, current_pred = model(
                 load_history, voltage_history, current_history
             )
-            voltage_loss = F.mse_loss(voltage_pred, voltage_target)
-            current_loss = F.mse_loss(current_pred, current_target)
-            total_loss = voltage_loss + LAMBDA_CURRENT * current_loss
+            voltage_loss = forecast_loss(voltage_pred, voltage_target)
+            current_loss = forecast_loss(current_pred, current_target)
+            total_loss = (
+                LAMBDA_VOLTAGE * voltage_loss
+                + LAMBDA_CURRENT * current_loss
+            )
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()
@@ -532,18 +580,18 @@ def main() -> None:
             examples += batch_size
 
         train_metrics = {name: value / examples for name, value in sums.items()}
-        val_metrics = evaluate_normalized(model, val_loader, device)
+        val_metrics = evaluate_model_space(model, val_loader, device)
         scheduler.step(val_metrics["total"])
         learning_rate = optimizer.param_groups[0]["lr"]
         history_rows.append(
             {
                 "epoch": epoch,
                 "train_total_loss": train_metrics["total"],
-                "train_voltage_mse_normalized": train_metrics["voltage"],
-                "train_current_mse_normalized": train_metrics["current"],
+                "train_voltage_loss_model_space": train_metrics["voltage"],
+                "train_current_loss_model_space": train_metrics["current"],
                 "val_total_loss": val_metrics["total"],
-                "val_voltage_mse_normalized": val_metrics["voltage"],
-                "val_current_mse_normalized": val_metrics["current"],
+                "val_voltage_loss_model_space": val_metrics["voltage"],
+                "val_current_loss_model_space": val_metrics["current"],
                 "learning_rate": learning_rate,
             }
         )
@@ -551,13 +599,17 @@ def main() -> None:
 
         print(
             f"epoch {epoch:03d} | "
-            f"train V-MSE {train_metrics['voltage']:.6f} "
-            f"I-MSE {train_metrics['current']:.6f} | "
-            f"val V-MSE {val_metrics['voltage']:.6f} "
-            f"I-MSE {val_metrics['current']:.6f} | lr {learning_rate:.2e}"
+            f"train V-loss {train_metrics['voltage']:.6f} "
+            f"I-loss {train_metrics['current']:.6f} | "
+            f"val V-loss {val_metrics['voltage']:.6f} "
+            f"I-loss {val_metrics['current']:.6f} | lr {learning_rate:.2e}"
         )
 
-        if val_metrics["total"] < best_val_loss:
+        improves_both_heads = (
+            val_metrics["voltage"] <= initial_val_metrics["voltage"]
+            and val_metrics["current"] <= initial_val_metrics["current"]
+        )
+        if val_metrics["total"] < best_val_loss and improves_both_heads:
             best_val_loss = val_metrics["total"]
             best_epoch = epoch
             stale_epochs = 0
@@ -603,6 +655,14 @@ def main() -> None:
         f"best epoch={best_epoch} | "
         f"test V-RMSE={test_metrics['voltage_vpu']['rmse']:.6f} Vpu | "
         f"test I-RMSE={test_metrics['current_amperes']['rmse']:.6f} A"
+    )
+    print(
+        f"current | R^2 {test_metrics['current_amperes']['r2']:.6f} | "
+        f"MSE {test_metrics['current_amperes']['mse']:.6f} A^2"
+    )
+    print(
+        f"voltage | R^2 {test_metrics['voltage_vpu']['r2']:.6f} | "
+        f"MSE {test_metrics['voltage_vpu']['mse']:.8f} Vpu^2"
     )
     print(f"saved LSTM results to {RESULTS_DIR}")
 

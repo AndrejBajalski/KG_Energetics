@@ -1,0 +1,2 @@
+Run started 20260830_224343 | device=cpu | window=30 horizon=15 hidden=64 batch_size=8 lambda_current=0.3 epochs=20
+epoch 00 | train V-MSE 0.057581 I-MSE 0.711433 | val V-MSE 0.001418 I-MSE 1.250081

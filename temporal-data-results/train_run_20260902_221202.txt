@@ -1,0 +1,2 @@
+Run started 20260902_221202 | device=cpu | window=30 horizon=15 hidden=64 batch_size=8 lambda_current=0.3 epochs=20
+Reporting in real units: V-MSE in Vpu^2, I-MSE in Amps^2; R^2 is per-entity (variance-weighted), same convention as hetero_gnn_model.py.

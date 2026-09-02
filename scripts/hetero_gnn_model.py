@@ -11,7 +11,9 @@ Requires: torch, torch_geometric, neo4j, pandas
 """
 
 import copy
+import csv
 import os
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -124,6 +126,23 @@ if __name__ == "__main__":
     # cheap way to test whether that's a limiting factor. Toggle to compare
     # against the default (False).
     INCLUDE_UPSTREAM = False
+
+    # Per-epoch train/validation metrics are appended here and flushed as soon
+    # as they are computed, so an interrupted or crashed run still leaves a
+    # usable partial log rather than nothing. NOTE: on Windows a leading "/"
+    # is drive-relative, so "/temp/..." resolves to <current drive>:\temp\,
+    # e.g. C:\temp\hetero_gnn_results.csv. The directory is created if absent.
+    RESULTS_CSV = Path("/temp/hetero_gnn_results.csv")
+    # 'eval_*' holds whichever split the row's 'split' column names, so the same
+    # columns carry validation during training and test in the final rows.
+    RESULTS_CSV_FIELDS = [
+        "split", "epoch",
+        "train_mse_v_vpu2", "train_mse_i_a2",
+        "eval_mse_v_vpu2", "eval_mse_i_a2",
+        "eval_mse_v_norm", "eval_mse_i_norm",
+        "eval_r2_v", "eval_r2_i", "eval_combined",
+        "is_best",
+    ]
 
     ds = FeederHeteroSnapshotDataset(
         neo4j_uri=os.environ.get("NEO4J_URI"),
@@ -251,6 +270,35 @@ if __name__ == "__main__":
             "r2_i": _r2(acc["i"]),   # per-line reference
         }
 
+    RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    results_file = RESULTS_CSV.open("w", newline="", encoding="utf-8")
+    results_writer = csv.DictWriter(results_file, fieldnames=RESULTS_CSV_FIELDS)
+    results_writer.writeheader()
+    results_file.flush()
+    print(f"writing per-epoch results to {RESULTS_CSV.resolve()}")
+
+    def log_results(split, epoch, evaluation, train_v=None, train_i=None,
+                    combined=None, is_best=None):
+        """Append one row and flush. Train columns are blank for the final
+        best-model rows, which report an evaluated split only."""
+        def num(x):
+            return "" if x is None else f"{x:.10g}"
+        results_writer.writerow({
+            "split": split,
+            "epoch": epoch,
+            "train_mse_v_vpu2": num(train_v),
+            "train_mse_i_a2": num(train_i),
+            "eval_mse_v_vpu2": num(evaluation["mse_v"]),
+            "eval_mse_i_a2": num(evaluation["mse_i"]),
+            "eval_mse_v_norm": num(evaluation["mse_v_norm"]),
+            "eval_mse_i_norm": num(evaluation["mse_i_norm"]),
+            "eval_r2_v": num(evaluation["r2_v"]),
+            "eval_r2_i": num(evaluation["r2_i"]),
+            "eval_combined": num(combined),
+            "is_best": "" if is_best is None else int(bool(is_best)),
+        })
+        results_file.flush()
+
     best_combined = float("inf")
     best_state = None
     best_epoch = -1
@@ -323,6 +371,9 @@ if __name__ == "__main__":
               f"| val R2 V {val['r2_v']:.4f} | val R2 I {val['r2_i']:.4f} "
               f"| combined {combined:.5f}{'  <-- best' if improved else ''}")
 
+        log_results("val", epoch, val, train_v=avg_loss_v, train_i=avg_loss_i,
+                    combined=combined, is_best=improved)
+
         if epochs_since_best >= PATIENCE:
             print(f"early stop: no improvement in {PATIENCE} epochs "
                   f"(best epoch {best_epoch}, combined {best_combined:.5f})")
@@ -348,3 +399,10 @@ if __name__ == "__main__":
           f"| R2 V {test['r2_v']:.4f} | R2 I {test['r2_i']:.4f}")
     print("(MSE I in Amps^2; R2 is per-entity: R2 V vs each bus's own mean, "
           "R2 I vs each line's own mean; R2 <= 0 means no better than the mean)")
+
+    # Best-epoch weights are already restored above, so these two rows describe
+    # the model actually being reported, not the last epoch trained.
+    log_results("val_best", best_epoch, val)
+    log_results("test_best", best_epoch, test)
+    results_file.close()
+    print(f"results written to {RESULTS_CSV.resolve()}")

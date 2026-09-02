@@ -13,8 +13,8 @@ class CSVForecastLSTM(nn.Module):
     the small load vector is not overwhelmed by the much wider target vectors.
     One shared horizon-conditioned output mapping replaces the previous giant
     independent output layer. Predictions are residual corrections to a
-    training-fitted mean-reversion baseline built from the latest 30-minute
-    trend.
+    training-fitted mean-reversion baseline built from the full configured
+    input-window trend.
     """
 
     def __init__(
@@ -134,7 +134,7 @@ class CSVForecastLSTM(nn.Module):
         voltage_history: torch.Tensor,
         current_history: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Training-fitted mean-reversion baseline from the 30-minute trend."""
+        """Training-fitted mean-reversion baseline from the input-window trend."""
 
         trend_steps = voltage_history.size(1) - 1
         voltage_slope = (

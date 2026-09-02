@@ -1,17 +1,17 @@
 {
   "voltage_vpu": {
-    "mae": 0.0031329177621643497,
-    "mse": 1.7575937672943482e-05,
-    "rmse": 0.004192366595724124,
-    "r2": 0.3660149522604089,
-    "max_absolute_error": 0.0185239315032959
+    "mae": 0.002897221496406228,
+    "mse": 1.626231395158843e-05,
+    "rmse": 0.004032655942624963,
+    "r2": 0.4133989276244765,
+    "max_absolute_error": 0.019852161407470703
   },
   "current_amperes": {
-    "mae": 2.1729433022236706,
-    "mse": 25.026476715822966,
-    "rmse": 5.002646970936783,
-    "r2": 0.8306423032683115,
-    "max_absolute_error": 64.03670883178711
+    "mae": 1.9944254940906745,
+    "mse": 22.235328973182018,
+    "rmse": 4.7154351838597055,
+    "r2": 0.8495303936015647,
+    "max_absolute_error": 62.07185745239258
   },
   "persistence_baseline": {
     "voltage_vpu": {
@@ -46,9 +46,206 @@
     }
   },
   "rmse_improvement_over_persistence_percent": {
-    "voltage": 4.631537733481515,
-    "current": 2.1578365512303344
+    "voltage": 8.26465498262264,
+    "current": 7.775147302691663
   },
   "test_windows": 203,
-  "forecast_horizon": 15
+  "forecast_horizon": 15,
+  "metrics_by_horizon": [
+    {
+      "horizon_minute": 1,
+      "voltage_mae_vpu": 0.0011976714200795861,
+      "voltage_mse_vpu_squared": 4.534181458473713e-06,
+      "voltage_rmse_vpu": 0.0021293617490867334,
+      "voltage_r2": 0.8329189079703082,
+      "voltage_max_abs_error_vpu": 0.01673877239227295,
+      "current_mae_a": 0.7476357814723246,
+      "current_mse_a_squared": 6.418869546911581,
+      "current_rmse_a": 2.533548804920004,
+      "current_r2": 0.958039667716585,
+      "current_max_abs_error_a": 52.67818069458008
+    },
+    {
+      "horizon_minute": 2,
+      "voltage_mae_vpu": 0.0019524203988060334,
+      "voltage_mse_vpu_squared": 8.792663976332947e-06,
+      "voltage_rmse_vpu": 0.0029652426504980915,
+      "voltage_r2": 0.6770797903892023,
+      "voltage_max_abs_error_vpu": 0.01735234260559082,
+      "current_mae_a": 1.2543587539534218,
+      "current_mse_a_squared": 12.390021513753886,
+      "current_rmse_a": 3.51994623733856,
+      "current_r2": 0.9185416756530365,
+      "current_max_abs_error_a": 53.03517723083496
+    },
+    {
+      "horizon_minute": 3,
+      "voltage_mae_vpu": 0.002526554330831966,
+      "voltage_mse_vpu_squared": 1.2563426119654132e-05,
+      "voltage_rmse_vpu": 0.003544492364169252,
+      "voltage_r2": 0.5403888995287978,
+      "voltage_max_abs_error_vpu": 0.017258286476135254,
+      "current_mae_a": 1.6753350632401507,
+      "current_mse_a_squared": 17.9674885370145,
+      "current_rmse_a": 4.238807442785588,
+      "current_r2": 0.8812025526647577,
+      "current_max_abs_error_a": 53.886932373046875
+    },
+    {
+      "horizon_minute": 4,
+      "voltage_mae_vpu": 0.00266485388836202,
+      "voltage_mse_vpu_squared": 1.3554515094618188e-05,
+      "voltage_rmse_vpu": 0.0036816457046568436,
+      "voltage_r2": 0.5051570476295777,
+      "voltage_max_abs_error_vpu": 0.017029881477355957,
+      "current_mae_a": 1.7724197865556615,
+      "current_mse_a_squared": 19.132800300735692,
+      "current_rmse_a": 4.374105657244197,
+      "current_r2": 0.8728282488364885,
+      "current_max_abs_error_a": 54.60283184051514
+    },
+    {
+      "horizon_minute": 5,
+      "voltage_mae_vpu": 0.002787836978532456,
+      "voltage_mse_vpu_squared": 1.4510070952814914e-05,
+      "voltage_rmse_vpu": 0.0038092087042868776,
+      "voltage_r2": 0.4716047340473126,
+      "voltage_max_abs_error_vpu": 0.01635563373565674,
+      "current_mae_a": 1.8608370862385077,
+      "current_mse_a_squared": 20.214444827014056,
+      "current_rmse_a": 4.4960476895840475,
+      "current_r2": 0.8649369843951284,
+      "current_max_abs_error_a": 53.70060920715332
+    },
+    {
+      "horizon_minute": 6,
+      "voltage_mae_vpu": 0.0028392598058067766,
+      "voltage_mse_vpu_squared": 1.4998462434920835e-05,
+      "voltage_rmse_vpu": 0.003872784842322232,
+      "voltage_r2": 0.4554206222915642,
+      "voltage_max_abs_error_vpu": 0.01613926887512207,
+      "current_mae_a": 1.943456337721921,
+      "current_mse_a_squared": 21.159160798990268,
+      "current_rmse_a": 4.5999087815945074,
+      "current_r2": 0.8579144580787801,
+      "current_max_abs_error_a": 53.65042304992676
+    },
+    {
+      "horizon_minute": 7,
+      "voltage_mae_vpu": 0.0029755909160379262,
+      "voltage_mse_vpu_squared": 1.6145628926416645e-05,
+      "voltage_rmse_vpu": 0.004018162381788054,
+      "voltage_r2": 0.4153547960001639,
+      "voltage_max_abs_error_vpu": 0.0161285400390625,
+      "current_mae_a": 2.028656641056029,
+      "current_mse_a_squared": 22.177937469094594,
+      "current_rmse_a": 4.709345758074533,
+      "current_r2": 0.8502985347749279,
+      "current_max_abs_error_a": 53.87905025482178
+    },
+    {
+      "horizon_minute": 8,
+      "voltage_mae_vpu": 0.0030853682889233048,
+      "voltage_mse_vpu_squared": 1.743291322199817e-05,
+      "voltage_rmse_vpu": 0.0041752740295695765,
+      "voltage_r2": 0.3707615200089517,
+      "voltage_max_abs_error_vpu": 0.0165022611618042,
+      "current_mae_a": 2.1100492444280876,
+      "current_mse_a_squared": 23.396577842238166,
+      "current_rmse_a": 4.837000914020812,
+      "current_r2": 0.8413164568965428,
+      "current_max_abs_error_a": 53.78053092956543
+    },
+    {
+      "horizon_minute": 9,
+      "voltage_mae_vpu": 0.0031699506755982717,
+      "voltage_mse_vpu_squared": 1.8564506825520677e-05,
+      "voltage_rmse_vpu": 0.004308654874264203,
+      "voltage_r2": 0.33048588041743365,
+      "voltage_max_abs_error_vpu": 0.018640637397766113,
+      "current_mae_a": 2.1819536957558943,
+      "current_mse_a_squared": 24.516980538341613,
+      "current_rmse_a": 4.9514624645998895,
+      "current_r2": 0.8329398945694617,
+      "current_max_abs_error_a": 53.91404342651367
+    },
+    {
+      "horizon_minute": 10,
+      "voltage_mae_vpu": 0.003220362419247722,
+      "voltage_mse_vpu_squared": 1.9229438900897832e-05,
+      "voltage_rmse_vpu": 0.004385138412969177,
+      "voltage_r2": 0.30671955330804346,
+      "voltage_max_abs_error_vpu": 0.019078373908996582,
+      "current_mae_a": 2.2497287104499373,
+      "current_mse_a_squared": 25.458777990631003,
+      "current_rmse_a": 5.045669231195303,
+      "current_r2": 0.825691945797367,
+      "current_max_abs_error_a": 54.169610023498535
+    },
+    {
+      "horizon_minute": 11,
+      "voltage_mae_vpu": 0.0032772286357314853,
+      "voltage_mse_vpu_squared": 1.9695972203572953e-05,
+      "voltage_rmse_vpu": 0.004438014443822029,
+      "voltage_r2": 0.29116608557319856,
+      "voltage_max_abs_error_vpu": 0.018837451934814453,
+      "current_mae_a": 2.3077807097187986,
+      "current_mse_a_squared": 26.295480657397064,
+      "current_rmse_a": 5.12791191981659,
+      "current_r2": 0.8191949992746901,
+      "current_max_abs_error_a": 61.53306579589844
+    },
+    {
+      "horizon_minute": 12,
+      "voltage_mae_vpu": 0.0033076561661777946,
+      "voltage_mse_vpu_squared": 1.9979455797037974e-05,
+      "voltage_rmse_vpu": 0.004469838453125345,
+      "voltage_r2": 0.2833549528835094,
+      "voltage_max_abs_error_vpu": 0.019219398498535156,
+      "current_mae_a": 2.36021289207411,
+      "current_mse_a_squared": 27.253573184545125,
+      "current_rmse_a": 5.220495492244498,
+      "current_r2": 0.8116864582778024,
+      "current_max_abs_error_a": 61.54112434387207
+    },
+    {
+      "horizon_minute": 13,
+      "voltage_mae_vpu": 0.003394698066485553,
+      "voltage_mse_vpu_squared": 2.0606381666702385e-05,
+      "voltage_rmse_vpu": 0.004539425257309827,
+      "voltage_r2": 0.26526325535112205,
+      "voltage_max_abs_error_vpu": 0.01949930191040039,
+      "current_mae_a": 2.417568761163008,
+      "current_mse_a_squared": 28.259774519515588,
+      "current_rmse_a": 5.315992336292029,
+      "current_r2": 0.8044361670421356,
+      "current_max_abs_error_a": 61.52848720550537
+    },
+    {
+      "horizon_minute": 14,
+      "voltage_mae_vpu": 0.003479092398979824,
+      "voltage_mse_vpu_squared": 2.1247349177255525e-05,
+      "voltage_rmse_vpu": 0.0046094846975833995,
+      "voltage_r2": 0.24695665321915738,
+      "voltage_max_abs_error_vpu": 0.019852161407470703,
+      "current_mae_a": 2.4701290341698443,
+      "current_mse_a_squared": 29.045342601100337,
+      "current_rmse_a": 5.389373117636256,
+      "current_r2": 0.7986201719831494,
+      "current_max_abs_error_a": 62.07185745239258
+    },
+    {
+      "horizon_minute": 15,
+      "voltage_mae_vpu": 0.0035797780564927016,
+      "voltage_mse_vpu_squared": 2.2079742517609562e-05,
+      "voltage_rmse_vpu": 0.004698908651762616,
+      "voltage_r2": 0.22407690081311016,
+      "voltage_max_abs_error_vpu": 0.01953744888305664,
+      "current_mae_a": 2.5362599133624264,
+      "current_mse_a_squared": 29.842704270446774,
+      "current_rmse_a": 5.462847633830434,
+      "current_r2": 0.7925095044203689,
+      "current_max_abs_error_a": 61.52517080307007
+    }
+  ]
 }

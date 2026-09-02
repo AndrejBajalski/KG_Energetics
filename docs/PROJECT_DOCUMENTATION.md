@@ -649,11 +649,11 @@ pairs the loads at minute `t` with the labels at minute `t` (`_load_np[idx]` wit
 surrogate for the power-flow solve, **not** a forecaster. It has no lead time and
 no temporal component.
 
-Two separate scripts attack the forecasting problem instead: predict the next
-**15 minutes** from the previous **30 minutes** of observations. Both are direct
-multi-horizon models — all 15 future minutes come out of one forward pass rather
-than by feeding a one-step prediction back in, which avoids compounding
-recursive error.
+Two separate scripts attack the forecasting problem instead. The temporal GNN
+uses 30 minutes of history, while the tuned CSV-only LSTM uses 22 minutes; both
+predict the next **15 minutes**. Both are direct multi-horizon models — all 15
+future minutes come out of one forward pass rather than by feeding a one-step
+prediction back in, which avoids compounding recursive error.
 
 ### 9.1 `TemporalVoltageHeteroGNN` (`temporal_model.py`, trained by `train_temporal.py`)
 
@@ -712,12 +712,12 @@ graph buys anything a purely temporal model cannot get on its own.
 
 ```
 load history    (55)  ─ levels + Δ ─► Linear+GELU ─► 64 ┐
-voltage history (906) ─ PCA→16 ─ levels + Δ ─► ... ─► 96 ├─► fusion 256→192
+voltage history (906) ─ PCA→16 ─ levels + Δ ─► ... ─► 96 ├─► fusion 256→224
 current history (905) ─ PCA→64 ─ levels + Δ ─► ... ─► 96 ┘   GELU + LayerNorm
                                                                   │
-                                                     LSTM ×2, hidden 192, dropout 0.1
+                                                     LSTM ×1, hidden 224
                                                                   │
-                            last step + horizon embedding (15×192) → Linear+GELU+Dropout
+                            last step + horizon embedding (15×224) → Linear+GELU+Dropout(0.2)
                                                                   │
                           voltage/current delta heads (latent) → project back via basisᵀ
                                                                   │
@@ -735,31 +735,36 @@ current history (905) ─ PCA→64 ─ levels + Δ ─► ... ─► 96 ┘   GE
   short-term direction and rate of change explicit rather than something the
   recurrence must infer.
 - **Residual around a fitted trend baseline.** The baseline extrapolates the
-  slope of the last 30 minutes with training-fitted coefficients; the network only
-  predicts a correction on top. **Both delta heads are zero-initialized**, so
-  training begins at exactly the baseline and can only improve from there — the
+  slope across the configured 22-minute input window with training-fitted
+  coefficients; the network only predicts a correction on top. **Both delta
+  heads are zero-initialized**, so training begins at exactly the baseline — the
   same design instinct as the temporal GNN's persistence residual.
-- **Configuration:** 721 040 trainable parameters, AdamW, lr `1e-4`, weight decay
-  `1e-5`, batch 32, gradient clipping 1.0, `lambda_current=0.3`, LR halved on an
-  8-epoch validation plateau. 963 / 202 / 203 train/val/test windows.
+- **Configuration:** 556 080 trainable parameters, AdamW, lr `1e-4`, weight
+  decay `1e-4`, batch 32, Huber delta 1.0, gradient clipping 1.0,
+  `lambda_current=1.0`, and `lambda_voltage=0.1`. Checkpointing, LR scheduling,
+  and early stopping maximize validation current R² at the 5-minute horizon.
+  The configuration was selected using 39 training runs over three pre-test
+  chronological folds after a 94-trial exploratory sweep. There are
+  971 / 202 / 203 train/validation/test windows.
 
-**Results** (held-out test, best epoch 6, from `lstm-data-results/`):
+**Results** (held-out test, best epoch 2, from `lstm-data-results/`):
 
 | Method | Voltage RMSE (Vpu) | Current RMSE (A) |
 |---|---:|---:|
 | Persistence (repeat last observation) | 0.004396 | 5.113 |
-| Training-fitted trend baseline | **0.004034** | **4.700** |
-| CSVForecastLSTM | 0.004050 | 4.914 |
+| Training-fitted trend baseline | 0.004140 | **4.782** |
+| CSVForecastLSTM | **0.004138** | 4.787 |
 
-LSTM voltage MAE 0.002989 Vpu (max abs 0.018693); current MAE 2.143 A (max abs
-61.161 A). Against persistence it improves RMSE by 7.9% (voltage) and 3.9%
-(current), and maximum error by 21.4% and 19.7%.
+LSTM voltage MAE is 0.002896 Vpu and current MAE is 1.984 A. Against
+persistence it improves RMSE by 5.86% for voltage and 6.38% for current. At the
+five-minute focus horizon, current R² is **0.859688** and MSE is **21.000 A²**;
+the previous run scored 0.851663 and 22.201 A².
 
-Read honestly: **the LSTM does not beat the fitted trend baseline on average.**
-Its voltage RMSE is marginally worse and its current RMSE is ~4.6% worse; its
-genuine advantage is in the *extreme* errors. A more complex model did not
-automatically outperform a well-constructed statistical baseline, and one
-simulated day is not enough evidence to claim it would.
+Read honestly: the LSTM is essentially tied with the fitted trend baseline over
+all 15 horizons: voltage RMSE is marginally better, while current RMSE is about
+0.1% worse. The tuned model does improve the requested five-minute current
+score over the previous model, but one simulated day is not enough evidence to
+claim the gain will generalize to other days.
 
 ### 9.3 A caution on comparing the three models
 

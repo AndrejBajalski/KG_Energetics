@@ -37,12 +37,14 @@ RESULTS_DIR = BASE_DIR / "lstm-data-results"
 
 WINDOW = 30
 HORIZON = 15
-HIDDEN = 128
+REPORT_HORIZONS = (1, 5, 10, 15)
+FOCUS_HORIZON = 5
+HIDDEN = 224
 LSTM_LAYERS = 1
 DROPOUT = 0.2
 BATCH_SIZE = 32
 EPOCHS = 100
-LEARNING_RATE = 17e-5
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 LAMBDA_VOLTAGE = 0.7
 LAMBDA_CURRENT = 1.0
@@ -100,10 +102,26 @@ def evaluate_model_space(
     model: CSVForecastLSTM,
     loader: DataLoader,
     device: torch.device,
+    voltage_scaler: FeatureStandardizer,
+    current_scaler: FeatureStandardizer,
 ) -> dict[str, float]:
     model.eval()
     sums = {"total": 0.0, "voltage": 0.0, "current": 0.0}
     examples = 0
+    physical_stats = {
+        "voltage_sse": 0.0,
+        "voltage_sum": 0.0,
+        "voltage_sum_sq": 0.0,
+        "voltage_count": 0,
+        "current_sse": 0.0,
+        "current_sum": 0.0,
+        "current_sum_sq": 0.0,
+        "current_count": 0,
+    }
+    voltage_mean = voltage_scaler.mean.to(device)
+    voltage_std = voltage_scaler.std.to(device)
+    current_mean = current_scaler.mean.to(device)
+    current_std = current_scaler.std.to(device)
 
     with torch.no_grad():
         for batch in loader:
@@ -129,7 +147,42 @@ def evaluate_model_space(
             sums["current"] += current_loss.item() * batch_size
             examples += batch_size
 
-    return {name: value / examples for name, value in sums.items()}
+            focus_index = FOCUS_HORIZON - 1
+            physical_values = {
+                "voltage": (
+                    voltage_pred[:, focus_index] * voltage_std + voltage_mean,
+                    voltage_target[:, focus_index] * voltage_std + voltage_mean,
+                ),
+                "current": (
+                    current_pred[:, focus_index] * current_std + current_mean,
+                    current_target[:, focus_index] * current_std + current_mean,
+                ),
+            }
+            for head, (prediction, target) in physical_values.items():
+                prediction_64 = prediction.double()
+                target_64 = target.double()
+                physical_stats[f"{head}_sse"] += (
+                    (prediction_64 - target_64).square().sum().item()
+                )
+                physical_stats[f"{head}_sum"] += target_64.sum().item()
+                physical_stats[f"{head}_sum_sq"] += target_64.square().sum().item()
+                physical_stats[f"{head}_count"] += target_64.numel()
+
+    result = {name: value / examples for name, value in sums.items()}
+    for head in ("voltage", "current"):
+        count = physical_stats[f"{head}_count"]
+        sse = physical_stats[f"{head}_sse"]
+        total_sum_of_squares = (
+            physical_stats[f"{head}_sum_sq"]
+            - physical_stats[f"{head}_sum"] ** 2 / count
+        )
+        result[f"{head}_mse_at_focus_horizon"] = sse / count
+        result[f"{head}_r2_at_focus_horizon"] = (
+            1.0 - sse / total_sum_of_squares
+            if total_sum_of_squares > 0.0
+            else float("nan")
+        )
+    return result
 
 
 def scaler_state(scaler: FeatureStandardizer) -> dict[str, torch.Tensor]:
@@ -179,7 +232,7 @@ def save_checkpoint(
     path: Path,
     model: CSVForecastLSTM,
     epoch: int,
-    best_val_loss: float,
+    validation_metrics: dict[str, float],
     load_scaler: FeatureStandardizer,
     voltage_scaler: FeatureStandardizer,
     current_scaler: FeatureStandardizer,
@@ -188,7 +241,14 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "best_val_loss": best_val_loss,
+            "best_val_loss": validation_metrics["total"],
+            "selection_metric": (
+                f"validation_current_r2_at_{FOCUS_HORIZON}_minutes"
+            ),
+            "selection_metric_value": validation_metrics[
+                "current_r2_at_focus_horizon"
+            ],
+            "validation_metrics": validation_metrics,
             "model_config": model.configuration(),
             "model_state_dict": model.state_dict(),
             "scalers": {
@@ -300,6 +360,7 @@ def save_test_results(
     voltage_names: list[str],
     current_names: list[str],
     results_dir: Path,
+    report_horizons: tuple[int, ...],
 ) -> dict[str, object]:
     voltage_pred = predictions["voltage_predictions"]
     voltage_true = predictions["voltage_targets"]
@@ -310,6 +371,17 @@ def save_test_results(
     trend_voltage = predictions["trend_voltage_predictions"]
     trend_current = predictions["trend_current_predictions"]
     target_indices = predictions["target_indices"]
+
+    invalid_horizons = [
+        minute
+        for minute in report_horizons
+        if minute < 1 or minute > voltage_pred.shape[1]
+    ]
+    if invalid_horizons:
+        raise ValueError(
+            f"report horizons must be between 1 and {voltage_pred.shape[1]}; "
+            f"got {invalid_horizons}"
+        )
 
     per_horizon_rows = []
     for horizon_index in range(voltage_pred.shape[1]):
@@ -365,6 +437,7 @@ def save_test_results(
         },
         "test_windows": int(voltage_pred.shape[0]),
         "forecast_horizon": int(voltage_pred.shape[1]),
+        "metrics_by_horizon": per_horizon_rows,
     }
     with (results_dir / "test_metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(overall, handle, indent=2)
@@ -379,21 +452,63 @@ def save_test_results(
         current_line_names=np.asarray(current_names),
     )
 
-    # Also save the one-minute-ahead predictions as human-readable CSV files.
-    voltage_h1 = pd.DataFrame(voltage_pred[:, 0, :], columns=voltage_names)
-    voltage_h1.insert(0, "target_timestep", timesteps[target_indices[:, 0]])
-    voltage_h1.to_csv(results_dir / "test_voltage_predictions_h1.csv", index=False)
+    # Save selected forecast horizons as human-readable prediction CSV files.
+    for minute in dict.fromkeys(report_horizons):
+        horizon_index = minute - 1
+        target_timestep = timesteps[target_indices[:, horizon_index]]
 
-    current_h1 = pd.DataFrame(current_pred[:, 0, :], columns=current_names)
-    current_h1.insert(0, "target_timestep", timesteps[target_indices[:, 0]])
-    current_h1.to_csv(results_dir / "test_current_predictions_h1.csv", index=False)
+        voltage_frame = pd.DataFrame(
+            voltage_pred[:, horizon_index, :], columns=voltage_names
+        )
+        voltage_frame.insert(0, "target_timestep", target_timestep)
+        voltage_frame.to_csv(
+            results_dir / f"test_voltage_predictions_h{minute}.csv", index=False
+        )
+
+        current_frame = pd.DataFrame(
+            current_pred[:, horizon_index, :], columns=current_names
+        )
+        current_frame.insert(0, "target_timestep", target_timestep)
+        current_frame.to_csv(
+            results_dir / f"test_current_predictions_h{minute}.csv", index=False
+        )
     return overall
 
 
 def main() -> None:
     set_seed(SEED)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not 1 <= FOCUS_HORIZON <= HORIZON:
+        raise ValueError(
+            f"FOCUS_HORIZON must be between 1 and HORIZON ({HORIZON})"
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    previous_run_at_focus_horizon = None
+    previous_summary_path = RESULTS_DIR / "run_summary.json"
+    if previous_summary_path.exists():
+        with previous_summary_path.open("r", encoding="utf-8") as handle:
+            previous_summary = json.load(handle)
+        previous_run_at_focus_horizon = previous_summary.get(
+            "previous_run_at_focus_horizon"
+        )
+        if previous_run_at_focus_horizon is None:
+            previous_horizon_metrics = next(
+                (
+                    row
+                    for row in previous_summary.get("test_metrics", {}).get(
+                        "metrics_by_horizon", []
+                    )
+                    if row.get("horizon_minute") == FOCUS_HORIZON
+                ),
+                None,
+            )
+            if previous_horizon_metrics is not None:
+                previous_run_at_focus_horizon = {
+                    "configuration": previous_summary.get("configuration", {}),
+                    "best_epoch": previous_summary.get("best_epoch"),
+                    "test_metrics": previous_horizon_metrics,
+                }
 
     data = load_computed_time_series(
         load_profiles_path=COMPUTED_DIR / "load_profiles.csv",
@@ -429,6 +544,17 @@ def main() -> None:
     val_loader = make_loader(val_dataset, shuffle=False, device=device)
     test_loader = make_loader(test_dataset, shuffle=False, device=device)
 
+    # Match the tuning harness exactly: each randomized PCA fit receives a
+    # stable independent seed, then model initialization restarts from SEED.
+    set_seed(SEED + VOLTAGE_PCA_COMPONENTS)
+    voltage_basis = fit_spatial_basis(
+        model_voltages, train_range, VOLTAGE_PCA_COMPONENTS
+    )
+    set_seed(SEED + 1000 + CURRENT_PCA_COMPONENTS)
+    current_basis = fit_spatial_basis(
+        model_currents, train_range, CURRENT_PCA_COMPONENTS
+    )
+    set_seed(SEED)
     model = CSVForecastLSTM(
         load_input_dim=data.loads.size(1),
         num_voltage_targets=data.voltages.size(1),
@@ -437,12 +563,8 @@ def main() -> None:
         horizon=HORIZON,
         lstm_layers=LSTM_LAYERS,
         dropout=DROPOUT,
-        voltage_basis=fit_spatial_basis(
-            model_voltages, train_range, VOLTAGE_PCA_COMPONENTS
-        ),
-        current_basis=fit_spatial_basis(
-            model_currents, train_range, CURRENT_PCA_COMPONENTS
-        ),
+        voltage_basis=voltage_basis,
+        current_basis=current_basis,
         voltage_trend_coefficients=fit_trend_coefficients(
             model_voltages,
             train_dataset.valid_t,
@@ -461,7 +583,7 @@ def main() -> None:
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",
+        mode="max",
         factor=LR_FACTOR,
         patience=LR_PATIENCE,
         min_lr=MIN_LEARNING_RATE,
@@ -470,6 +592,8 @@ def main() -> None:
     config = {
         "window": WINDOW,
         "horizon": HORIZON,
+        "report_horizons": list(REPORT_HORIZONS),
+        "focus_horizon_minutes": FOCUS_HORIZON,
         "hidden": HIDDEN,
         "lstm_layers": LSTM_LAYERS,
         "dropout": DROPOUT,
@@ -483,7 +607,22 @@ def main() -> None:
         "huber_delta_model_space": HUBER_DELTA,
         "lambda_voltage": LAMBDA_VOLTAGE,
         "lambda_current": LAMBDA_CURRENT,
-        "checkpoint_requires_both_heads_to_beat_trend": True,
+        "checkpoint_selection_metric": (
+            f"validation current R2 at {FOCUS_HORIZON} minutes in physical amperes"
+        ),
+        "lr_scheduler_metric": (
+            f"validation current R2 at {FOCUS_HORIZON} minutes in physical amperes"
+        ),
+        "early_stopping_metric": (
+            f"validation current R2 at {FOCUS_HORIZON} minutes in physical amperes"
+        ),
+        "single_block_tuning_trial_count": 94,
+        "single_block_tuning_winner": "w102_hidden_224_vweight_010",
+        "multi_block_backtest_configuration_count": 13,
+        "multi_block_backtest_training_run_count": 39,
+        "selected_tuning_trial": "window_22_h224",
+        "selection_basis": "best mean current R2 at 5 minutes over three pre-test folds",
+        "test_set_used_for_tuning": False,
         "early_stopping_patience": EARLY_STOPPING_PATIENCE,
         "lr_scheduler_patience": LR_PATIENCE,
         "lr_scheduler_factor": LR_FACTOR,
@@ -521,15 +660,19 @@ def main() -> None:
     # The zero-initialized residual heads make epoch 0 the training-fitted
     # trend baseline. Save it before optimization so training can never
     # select a checkpoint that validates worse than this baseline.
-    initial_val_metrics = evaluate_model_space(model, val_loader, device)
+    initial_val_metrics = evaluate_model_space(
+        model, val_loader, device, voltage_scaler, current_scaler
+    )
     best_val_loss = initial_val_metrics["total"]
+    best_val_metrics = initial_val_metrics.copy()
+    best_val_current_r2 = initial_val_metrics["current_r2_at_focus_horizon"]
     best_epoch = 0
     stale_epochs = 0
     save_checkpoint(
         checkpoint_path,
         model,
         best_epoch,
-        best_val_loss,
+        best_val_metrics,
         load_scaler,
         voltage_scaler,
         current_scaler,
@@ -544,7 +687,8 @@ def main() -> None:
     )
     print(
         f"epoch 000 trend baseline | val V-loss {initial_val_metrics['voltage']:.6f} "
-        f"I-loss {initial_val_metrics['current']:.6f}"
+        f"I-loss {initial_val_metrics['current']:.6f} | "
+        f"I-R2@{FOCUS_HORIZON} {best_val_current_r2:.6f}"
     )
 
     for epoch in range(1, EPOCHS + 1):
@@ -580,8 +724,10 @@ def main() -> None:
             examples += batch_size
 
         train_metrics = {name: value / examples for name, value in sums.items()}
-        val_metrics = evaluate_model_space(model, val_loader, device)
-        scheduler.step(val_metrics["total"])
+        val_metrics = evaluate_model_space(
+            model, val_loader, device, voltage_scaler, current_scaler
+        )
+        scheduler.step(val_metrics["current_r2_at_focus_horizon"])
         learning_rate = optimizer.param_groups[0]["lr"]
         history_rows.append(
             {
@@ -592,6 +738,18 @@ def main() -> None:
                 "val_total_loss": val_metrics["total"],
                 "val_voltage_loss_model_space": val_metrics["voltage"],
                 "val_current_loss_model_space": val_metrics["current"],
+                "val_voltage_r2_at_focus_horizon": val_metrics[
+                    "voltage_r2_at_focus_horizon"
+                ],
+                "val_voltage_mse_at_focus_horizon_vpu_squared": val_metrics[
+                    "voltage_mse_at_focus_horizon"
+                ],
+                "val_current_r2_at_focus_horizon": val_metrics[
+                    "current_r2_at_focus_horizon"
+                ],
+                "val_current_mse_at_focus_horizon_a_squared": val_metrics[
+                    "current_mse_at_focus_horizon"
+                ],
                 "learning_rate": learning_rate,
             }
         )
@@ -602,22 +760,26 @@ def main() -> None:
             f"train V-loss {train_metrics['voltage']:.6f} "
             f"I-loss {train_metrics['current']:.6f} | "
             f"val V-loss {val_metrics['voltage']:.6f} "
-            f"I-loss {val_metrics['current']:.6f} | lr {learning_rate:.2e}"
+            f"I-loss {val_metrics['current']:.6f} | "
+            f"I-R2@{FOCUS_HORIZON} "
+            f"{val_metrics['current_r2_at_focus_horizon']:.6f} | "
+            f"lr {learning_rate:.2e}"
         )
 
-        improves_both_heads = (
-            val_metrics["voltage"] <= initial_val_metrics["voltage"]
-            and val_metrics["current"] <= initial_val_metrics["current"]
-        )
-        if val_metrics["total"] < best_val_loss and improves_both_heads:
+        if (
+            val_metrics["current_r2_at_focus_horizon"]
+            > best_val_current_r2 + 1e-7
+        ):
             best_val_loss = val_metrics["total"]
+            best_val_metrics = val_metrics.copy()
+            best_val_current_r2 = val_metrics["current_r2_at_focus_horizon"]
             best_epoch = epoch
             stale_epochs = 0
             save_checkpoint(
                 checkpoint_path,
                 model,
                 epoch,
-                best_val_loss,
+                best_val_metrics,
                 load_scaler,
                 voltage_scaler,
                 current_scaler,
@@ -640,12 +802,68 @@ def main() -> None:
         data.voltage_bus_names,
         data.current_line_names,
         RESULTS_DIR,
+        REPORT_HORIZONS,
     )
 
+    artifact_paths = {
+        "config": str(RESULTS_DIR / "config.json"),
+        "training_history": str(RESULTS_DIR / "training_history.csv"),
+        "best_model": str(RESULTS_DIR / "best_model.pt"),
+        "run_summary": str(RESULTS_DIR / "run_summary.json"),
+        "test_metrics": str(RESULTS_DIR / "test_metrics.json"),
+        "test_metrics_by_horizon": str(RESULTS_DIR / "test_metrics_by_horizon.csv"),
+        "full_test_predictions": str(RESULTS_DIR / "test_predictions.npz"),
+        "tuning_trials": str(BASE_DIR / "lstm-tuning-results" / "trials.csv"),
+        "tuning_summary": str(
+            BASE_DIR / "lstm-tuning-results" / "tuning_summary.json"
+        ),
+        "backtest_fold_results": str(
+            BASE_DIR / "lstm-backtest-results" / "fold_results.csv"
+        ),
+        "backtest_config_ranking": str(
+            BASE_DIR / "lstm-backtest-results" / "config_ranking.csv"
+        ),
+        "backtest_summary": str(
+            BASE_DIR / "lstm-backtest-results" / "backtest_summary.json"
+        ),
+        "voltage_prediction_csvs": {
+            str(minute): str(RESULTS_DIR / f"test_voltage_predictions_h{minute}.csv")
+            for minute in REPORT_HORIZONS
+        },
+        "current_prediction_csvs": {
+            str(minute): str(RESULTS_DIR / f"test_current_predictions_h{minute}.csv")
+            for minute in REPORT_HORIZONS
+        },
+    }
+    tuning_summary_path = BASE_DIR / "lstm-tuning-results" / "tuning_summary.json"
+    tuning_summary = None
+    if tuning_summary_path.exists():
+        with tuning_summary_path.open("r", encoding="utf-8") as handle:
+            tuning_summary = json.load(handle)
+
+    backtest_summary_path = (
+        BASE_DIR / "lstm-backtest-results" / "backtest_summary.json"
+    )
+    backtest_summary = None
+    if backtest_summary_path.exists():
+        with backtest_summary_path.open("r", encoding="utf-8") as handle:
+            backtest_summary = json.load(handle)
+
     run_summary = {
+        "configuration": config,
+        "completed_epochs": len(history_rows),
         "best_epoch": best_epoch,
         "best_validation_total_loss": best_val_loss,
+        "best_validation_current_r2_at_focus_horizon": best_val_current_r2,
+        "initial_validation_metrics": initial_val_metrics,
+        "best_validation_metrics": best_val_metrics,
+        "training_history": history_rows,
         "test_metrics": test_metrics,
+        "hyperparameter_tuning": tuning_summary,
+        "multi_block_backtest": backtest_summary,
+        "previous_run_at_focus_horizon": previous_run_at_focus_horizon,
+        "reported_prediction_horizons_minutes": list(REPORT_HORIZONS),
+        "artifacts": artifact_paths,
         "results_directory": str(RESULTS_DIR),
     }
     with (RESULTS_DIR / "run_summary.json").open("w", encoding="utf-8") as handle:
@@ -664,6 +882,18 @@ def main() -> None:
         f"voltage | R^2 {test_metrics['voltage_vpu']['r2']:.6f} | "
         f"MSE {test_metrics['voltage_vpu']['mse']:.8f} Vpu^2"
     )
+    metrics_by_minute = {
+        row["horizon_minute"]: row for row in test_metrics["metrics_by_horizon"]
+    }
+    for minute in REPORT_HORIZONS:
+        metrics = metrics_by_minute[minute]
+        print(
+            f"horizon {minute:02d} min | "
+            f"V: R^2 {metrics['voltage_r2']:.6f}, "
+            f"MSE {metrics['voltage_mse_vpu_squared']:.8f} Vpu^2 | "
+            f"I: R^2 {metrics['current_r2']:.6f}, "
+            f"MSE {metrics['current_mse_a_squared']:.6f} A^2"
+        )
     print(f"saved LSTM results to {RESULTS_DIR}")
 
 

@@ -4,8 +4,8 @@ CSV-only temporal dataset for the LSTM baseline.
 This module intentionally does not use Neo4j or PyTorch Geometric. It uses
 the same forecasting framing as train_temporal.py:
 
-    30 minutes of load, voltage, and current observations -> next 15 minutes
-    of bus voltage and line current.
+    A configurable window of load, voltage, and current observations -> the
+    next 15 minutes of bus voltage and line current.
 
 Voltage phase columns are collapsed to one conservative target per bus by
 taking the minimum phase voltage, matching hetero_gnn_dataset.py. SourceBus is
